@@ -163,6 +163,31 @@ command `npx wrangler deploy`. Two further mismatches were found in the same fil
 
 `functions/[[path]].ts` is **kept**, so the Pages deployment route stays available if you ever want it.
 
+### Problem #3 (found while verifying) — the failing checks on this PR are *preview* builds
+
+Cloudflare docs, Workers Builds: a *production* build (your production branch, `main`) runs the
+**Deploy command** (`npx wrangler deploy`), but a build on **any other branch uses the Preview command
+instead — default `npx wrangler preview`**. This PR's branch is not the production branch, so every check
+we saw was a preview build.
+
+That default command is broken with the Wrangler version this repo pins (`3.91.0`):
+
+```
+$ pnpm exec wrangler preview
+
+✘ [ERROR] Deprecation:
+  The `wrangler preview` command has been deprecated.
+  Try using `wrangler dev` to try out a worker during development.
+(exit code 1)
+```
+
+So preview builds fail no matter how the repository is configured — it is a **dashboard setting**
+(Settings → Build → Preview command), not a repo issue. The recommended value is
+`npx wrangler versions upload` (verified to exist in Wrangler 3.91).
+
+This also means the red checks on this PR do **not** by themselves tell us how the production build
+behaves — that runs the Deploy command, which is what fix `1096ce4` targets.
+
 ### Verification — all on this commit
 
 | Check | Before | After |
@@ -192,8 +217,9 @@ command `npx wrangler deploy`. Two further mismatches were found in the same fil
 
 | Setting | Value |
 |---------|-------|
-| Build command | `pnpm run build` *(also pinned in `wrangler.toml` via `[build] command`, so the repo is the source of truth)* |
-| Deploy command | `npx wrangler deploy` *(Workers Builds default — now works)* |
+| Build command | `pnpm run build` — **set this in the dashboard** (Settings → Build). Workers Builds does not read `[build] command` from `wrangler.toml`; that field is kept as a safety net because the Wrangler CLI *does* run it as part of `wrangler deploy` |
+| Deploy command | `npx wrangler deploy` *(Workers Builds default — now works with the new `wrangler.toml`)* |
+| Preview command | `npx wrangler versions upload` — the default `npx wrangler preview` is deprecated and exits 1 with Wrangler 3.91 (see §5, Problem #3) |
 | Root directory | *(blank — repository root)* |
 | Production branch | `main` |
 | Build output directory | *not used for Workers* (assets come from `[assets]` → `./build/client`) |
