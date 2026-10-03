@@ -19,6 +19,13 @@
 > | `fca1fda` | ❌ failure |
 > | **`bbcdb74`** — wrangler v4 + `[previews]` | ✅ **success** |
 > | **`df21b5b`** — final docs commit | ✅ **success** |
+> | **`f7cb408`** — report update | ✅ **success** |
+> | **`c745355`** — `main` after merging PR #1 | ✅ **success — production deploy** |
+>
+> The production run on `main` executed the Deploy command (`npx wrangler deploy`) against the Worker
+> service `bolt-replit` and finished green, creating deployment version
+> `bdc14b69-b0d0-418d-ae39-0bc9e011f372`:
+> [build eae661e7](https://dash.cloudflare.com/1410b416c3ad275a978e9d7410c416a6/workers/services/view/bolt-replit/production/builds/eae661e7-5f53-44ec-a40a-dfe244628955)
 >
 > Successful preview build:
 > [94e5e8fa](https://dash.cloudflare.com/1410b416c3ad275a978e9d7410c416a6/workers/services/view/bolt-replit/production/previews/arena-01a101ec-bolt-replit/builds/94e5e8fa-fdd2-4d17-9851-59b6d08ad0eb)
@@ -379,8 +386,9 @@ described in §6.
 
 ## 8. How to confirm the fix
 
-All three problems are now fixed in the repository, so no dashboard change is required for the build to
-succeed:
+**Status: done.** PR #1 was merged into `main` and the production deployment succeeded (see the banner at
+the top). All three problems are fixed in the repository, so no dashboard change is required for the build
+to succeed — the steps and settings below remain as reference:
 
 1. **`.tool-versions`** — removed; the 13:47 build log already confirms the tool installer no longer runs.
 2. **Worker vs Pages mismatch** — `wrangler.toml` is a valid Worker config and the deploy command works.
