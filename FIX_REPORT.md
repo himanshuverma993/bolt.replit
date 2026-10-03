@@ -4,8 +4,32 @@
 **Branch:** `arena/01a101ec-bolt-replit` → PR [#1](https://github.com/himanshuverma993/bolt.replit/pull/1)
 **Date:** 2026-10-03
 
-Two separate problems were found. **Fix #1 is committed and pushed. Fix #2 is a Cloudflare
-project-type mismatch and needs one decision from you (see §5).**
+> ## ✅ VERIFIED: the Cloudflare build now passes
+>
+> After commit `bbcdb74`, the Workers Build check on this branch went **green** — first time in the
+> repository's history:
+>
+> | Commit | Workers Builds check |
+> |--------|----------------------|
+> | `9959cea` (initial) | ❌ failure |
+> | `c472f4f` | ❌ failure |
+> | `e1c63e5` | ❌ failure |
+> | `fc2dc42` | ❌ failure |
+> | `8947148` | ❌ failure |
+> | `fca1fda` | ❌ failure |
+> | **`bbcdb74`** — wrangler v4 + `[previews]` | ✅ **success** |
+> | **`df21b5b`** — final docs commit | ✅ **success** |
+>
+> Successful preview build:
+> [94e5e8fa](https://dash.cloudflare.com/1410b416c3ad275a978e9d7410c416a6/workers/services/view/bolt-replit/production/previews/arena-01a101ec-bolt-replit/builds/94e5e8fa-fdd2-4d17-9851-59b6d08ad0eb)
+> · latest:
+> [c0f99340 / df21b5b](https://dash.cloudflare.com/1410b416c3ad275a978e9d7410c416a6/workers/services/view/bolt-replit/production/builds/c0f99340-2a84-48a4-ab6c-e8330319e8dc)
+
+Three separate problems were found and all three are now fixed:
+
+1. `.tool-versions` breaking the installer — fixed in `6f1adad`;
+2. Worker/Pages configuration mismatch — fixed in `1096ce4`;
+3. the preview command failing on non-production branches — fixed in `bbcdb74`.
 
 ---
 
