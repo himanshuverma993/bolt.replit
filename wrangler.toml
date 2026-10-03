@@ -1,6 +1,18 @@
 #:schema node_modules/wrangler/config-schema.json
-name = "bolt"
+name = "bolt-replit"
+main = "./workers/entry.ts"
 compatibility_flags = ["nodejs_compat"]
 compatibility_date = "2024-07-01"
-pages_build_output_dir = "./build/client"
 send_metrics = false
+
+[build]
+command = "pnpm run build"
+
+[assets]
+directory = "./build/client"
+binding = "ASSETS"
+
+# Required by `npx wrangler preview` (Worker Previews, used by Workers Builds for
+# non-production branches). Intentionally empty: this Worker's Previews need no
+# bindings, vars or secrets of their own beyond what is set at the top level.
+[previews]
