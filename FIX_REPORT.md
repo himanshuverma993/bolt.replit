@@ -188,6 +188,53 @@ So preview builds fail no matter how the repository is configured — it is a **
 This also means the red checks on this PR do **not** by themselves tell us how the production build
 behaves — that runs the Deploy command, which is what fix `1096ce4` targets.
 
+### Build-log evidence (the 13:47 UTC build of `fca1fda`) — everything up to the deploy step is green
+
+Key lines from the Cloudflare build log, in order:
+
+```
+13:47:03.630  Restoring from dependencies cache
+13:47:04.627  Detected the following tools from environment: pnpm@9.4.0, nodejs@22.16.0   <- .nvmrc honoured
+13:47:04.627  Installing nodejs 22.16.0
+13:47:15.128  Installing project dependencies: pnpm install --frozen-lockfile
+13:47:15.742  Lockfile is up to date, resolution step is skipped
+13:47:33.066  Done in 17.8s
+13:47:33.194  Executing user build command: pnpm run build
+13:47:37.654  vite v5.4.11 building for production...
+13:47:54.310  ✓ 1874 modules transformed.
+13:48:01.992  build/client/assets/... (all assets written)
+```
+
+Confirmed by this log:
+
+* **no `Found a .tool-versions file...` line any more** → Problem #1 is gone;
+* the toolchain the build used is exactly the one now pinned (`.nvmrc` = `nodejs@22.16.0`,
+  `packageManager` = `pnpm@9.4.0`);
+* dependency install succeeds with `--frozen-lockfile` (lockfile in sync);
+* the build command runs and completes the client build.
+
+The paste stops at 13:48:02; the build was marked failed at 13:48:07, i.e. ~5 s later — enough for the
+SSR build (~1 s) and then an *immediate* failure at the deploy step. The lines that name that step
+(`Executing user deploy command: ...` followed by the error) are what the next log paste needs to show.
+
+### Technical note — why `previews` cannot simply be added to `wrangler.toml` today
+
+`previews` is a Wrangler **v4** configuration field (the Worker Previews beta). The version this repo pins
+(`wrangler@3.91.0`) does not know it, and worse, adding `[previews]` while 3.91 is installed breaks the
+build itself — reproduced locally:
+
+```
+$ pnpm exec wrangler deploy --dry-run      # with [previews] present and wrangler 3.91 pinned
+▲ [WARNING] Processing wrangler.toml configuration:
+    - Unexpected fields found in top-level field: "previews"
+✘ [ERROR] Running custom build `pnpm run build` failed.      (exit 1)
+```
+
+With `wrangler@4.147.0` the same config is accepted and `deploy --dry-run` exits 0. So if the goal is to
+satisfy the default preview command **from the repository**, it has to be done as one coherent change:
+upgrade `wrangler` to v4 **and** add `previews = {}` — never the block alone. The dashboard route (below)
+needs neither.
+
 ### Verification — all on this commit
 
 | Check | Before | After |
@@ -219,7 +266,7 @@ behaves — that runs the Deploy command, which is what fix `1096ce4` targets.
 |---------|-------|
 | Build command | `pnpm run build` — **set this in the dashboard** (Settings → Build). Workers Builds does not read `[build] command` from `wrangler.toml`; that field is kept as a safety net because the Wrangler CLI *does* run it as part of `wrangler deploy` |
 | Deploy command | `npx wrangler deploy` *(Workers Builds default — now works with the new `wrangler.toml`)* |
-| Preview command | `npx wrangler versions upload` — the default `npx wrangler preview` is deprecated and exits 1 with Wrangler 3.91 (see §5, Problem #3) |
+| Preview command | `npx wrangler versions upload` — the default `npx wrangler preview` exits 1 with the pinned Wrangler 3.91 (see §5, Problem #3). Verified locally with this repo's config: `wrangler versions upload --dry-run` → exit 0 (`Total Upload: 3843.64 KiB`) |
 | Root directory | *(blank — repository root)* |
 | Production branch | `main` |
 | Build output directory | *not used for Workers* (assets come from `[assets]` → `./build/client`) |
