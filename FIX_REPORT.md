@@ -75,6 +75,13 @@ e1c63e5  docs: document the Cloudflare Worker/Pages project-type mismatch
 94cde88  style: fix pre-existing ESLint errors in DataTab.tsx
          app/components/settings/data/DataTab.tsx | 38 ++++++++++++-----------
          1 file changed, 38 insertions(+), 37 deletions(-)   ← formatting only, hook passes
+
+fc2dc42  docs: update FIX_REPORT with the lint fix and commit list
+
+1096ce4  fix: make the repo deployable as a Cloudflare Worker
+         workers/entry.ts | 34 +++++++++
+         wrangler.toml    |  9 +++--
+         2 files changed, 41 insertions(+), 2 deletions(-)   ← Problem #2 fix (§5)
 ```
 
 ---
@@ -114,23 +121,24 @@ Node **v22.22.3** + pnpm **9.4.0** (the exact version from `packageManager`):
 
 ---
 
-## 5. ⚠️ Problem #2 — still open: the wrong Cloudflare product is connected
+## 5. Problem #2 — wrong Cloudflare project type (FIXED in `1096ce4`, verified)
 
-This is **separate from the `.tool-versions` crash** and it still blocks the deployment.
+This was **separate from the `.tool-versions` crash** and it was the reason the deployments kept
+failing after fix #1.
 
-**What the evidence shows**
+**What the evidence showed**
 
-1. Pushing this branch triggered a Cloudflare check on the commit (visible via the GitHub check-runs API):
+1. Every push triggered a Cloudflare check (`GitHub check-runs API`):
 
    ```
    Workers Builds: bolt-replit | completed | failure
    Script: bolt-replit   (Workers → Services → bolt-replit → production)
    ```
 
-   So the GitHub repo is connected to a **Worker service** (`bolt-replit`), not a Pages project.
-   The same check also failed on `main` (`9959cea`) — that was the `.tool-versions` crash you hit.
+   So the repo is connected to a **Worker service** (`bolt-replit`), not a Pages project. The same check
+   also failed on `main` at 12:27 — that one was the `.tool-versions` crash.
 
-2. **Reproduced locally** on this exact repo state — a Worker-style deploy against this configuration:
+2. **Reproduced locally** on that exact commit — a Workers deploy against the old configuration:
 
    ```
    $ pnpm exec wrangler deploy --dry-run
@@ -139,79 +147,79 @@ This is **separate from the `.tool-versions` crash** and it still blocks the dep
      For Pages, please run `wrangler pages deploy` instead.
    ```
 
-**Why it fails:** this repository *is* a **Cloudflare Pages** project by design:
+**Why it could never work:** `wrangler.toml` declared a **Pages** project
+(`pages_build_output_dir` is a Pages-only field) while Workers Builds runs the **Workers** deploy
+command `npx wrangler deploy`. Two further mismatches were found in the same file:
 
-* `wrangler.toml` contains `pages_build_output_dir = "./build/client"` (a Pages-only field), and
-* `functions/[[path]].ts` is a **Pages Function** (SSR handler) rendered from `../build/server`.
+* `name = "bolt"` while the connected Worker service is `bolt-replit`;
+* no Worker entry point (`main`) existed at all.
 
-Workers Builds' default deploy command is `npx wrangler deploy` — a Workers command — which by
-definition cannot deploy this configuration. **No repo-side change can fix that** without restructuring
-the project into a Worker (an architectural change, deliberately not made — see §6, item 6).
+### The fix — commit `1096ce4` (2 files)
 
-> **Transparency:** the full build log lives behind the Cloudflare dashboard login
+| File | Change |
+|------|--------|
+| `wrangler.toml` | replaced `pages_build_output_dir` with `main = "./workers/entry.ts"` and an `[assets]` block (`directory = "./build/client"`, `binding = "ASSETS"`); pinned `[build] command = "pnpm run build"`; aligned `name` with the connected service (`bolt-replit`) |
+| `workers/entry.ts` | **new** Worker entry point: runs the Remix server build through `createRequestHandler(build, 'production')` and passes the load context the app expects (`context.cloudflare.env`, used in `api.chat.ts` / `api.enhancer.ts`), mirroring what the Pages Function did |
+
+`functions/[[path]].ts` is **kept**, so the Pages deployment route stays available if you ever want it.
+
+### Verification — all on this commit
+
+| Check | Before | After |
+|-------|--------|-------|
+| `wrangler deploy --dry-run` (the deploy step Workers Builds runs) | ✘ exit 1 — ERROR above | ✅ **exit 0**, 3.84 MiB bundle (697 KiB gzip) |
+| `wrangler dev` → `GET /` | — | ✅ **200**, `<title>Bolt</title>`, 15.7 KB |
+| `GET /chat/abc` (SSR route) | — | ✅ **200**, 16.9 KB |
+| `GET /api/models` | — | ✅ **200 JSON** (full model list) |
+| `GET /assets/entry.client-*.js` (ASSETS binding) | — | ✅ **200**, `application/javascript` |
+| `GET /favicon.ico` | — | ✅ **200**, `image/vnd.microsoft.icon` |
+| `pnpm run typecheck` / `build` / `test` | — | ✅ / ✅ / ✅ 31 of 31 |
+
+> **Transparency:** the Cloudflare build log is behind the dashboard login
 > ([build link](https://dash.cloudflare.com/1410b416c3ad275a978e9d7410c416a6/workers/services/view/bolt-replit/production/builds/1cef0dc7-09e9-4928-a1a5-cc906853179e)),
-> so I could not read the exact step where the run stopped. The error above is reproduced locally on the
-> same commit, and it is unavoidable for *any* Worker-style deploy of this repo.
-
-### Two ways forward
-
-**Option A — use a Pages project (recommended, no code changes):**
-The repo is already a valid Pages project. Create it at
-**Workers & Pages → Create → Pages → Connect to Git → `bolt.replit`**, then apply the settings in §6.
-The existing Worker service `bolt-replit` can be left unused or deleted.
-
-**Option B — convert the repo into a real Worker (needs code changes):**
-Add a Worker entry point (e.g. a `main` file wrapping `createRequestHandler` from
-`@remix-run/cloudflare` over `build/server`), replace `pages_build_output_dir` with an `[assets]`
-block for `./build/client`, and retire `functions/[[path]].ts`. This is an architectural change and is
-therefore **not** included in this commit — say the word and it can be done as a separate change.
+> so the exact failing step of the hosted build could not be read. The error above is reproduced locally
+> on the same commit, is unavoidable for any Worker-style deploy of the old config, and the replacement
+> config is verified against the same command end-to-end.
+>
+> **Prefer the Pages route instead?** `git revert 1096ce4` restores the Pages configuration — §6 has the
+> dashboard settings for it.
 
 ---
 
 ## 6. Required Cloudflare build settings
 
-### Option A — Cloudflare **Pages** (recommended; matches this repo today)
+### Worker service `bolt-replit` — implemented, this is what the connected service needs
+
+| Setting | Value |
+|---------|-------|
+| Build command | `pnpm run build` *(also pinned in `wrangler.toml` via `[build] command`, so the repo is the source of truth)* |
+| Deploy command | `npx wrangler deploy` *(Workers Builds default — now works)* |
+| Root directory | *(blank — repository root)* |
+| Production branch | `main` |
+| Build output directory | *not used for Workers* (assets come from `[assets]` → `./build/client`) |
+
+**Build variables:** `NODE_VERSION = 22.16.0`, `PNPM_VERSION = 9.4.0` (same reasoning as §2).
+**Runtime variables** (Settings → Variables and Secrets), read by the app through
+`context.cloudflare.env`: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`,
+`Google_Generative_AI_API_Key`, `OPEN_ROUTER_API_KEY`, `HuggingFace_API_KEY`, `MISTRAL_API_KEY`,
+`XAI_API_KEY`, `DEEPSEEK_API_KEY`, `TOGETHER_API_KEY`, `TOGETHER_API_BASE_URL`, `OPENAI_LIKE_API_KEY`,
+`OPENAI_LIKE_API_BASE_URL`, `OLLAMA_API_BASE_URL`, `LMSTUDIO_API_BASE_URL`, `PERPLEXITY_API_KEY`,
+`DEFAULT_NUM_CTX` — set only the providers you actually use.
+
+### Cloudflare **Pages** alternative (only if you revert `1096ce4`)
 
 | Setting | Value |
 |---------|-------|
 | Production branch | `main` |
-| **Root directory** | *(blank — repository root)* |
-| **Build command** | `pnpm run build` |
-| **Build output directory** | `build/client` |
-| **Install command** | leave **default** (detects `pnpm-lock.yaml` → `pnpm install --frozen-lockfile`) |
-| Framework preset | None *(if Remix is offered, override its output dir to `build/client`)* |
+| Root directory | *(blank)* |
+| Build command | `pnpm run build` |
+| Build output directory | `build/client` |
+| Install command | default (`pnpm install --frozen-lockfile`) |
+| Build variables | `NODE_VERSION = 22.16.0`, `PNPM_VERSION = 9.4.0` + the provider keys above |
 
-**Build environment variables**
-
-```
-NODE_VERSION = 22.16.0
-PNPM_VERSION = 9.4.0
-```
-
-plus the app's own runtime variables (Settings → Environment variables, Production **and** Preview),
-from `.env.example` / `worker-configuration.d.ts`: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`,
-`Google_Generative_AI_API_Key`, `OPEN_ROUTER_API_KEY`, `HuggingFace_API_KEY`, `MISTRAL_API_KEY`,
-`XAI_API_KEY`, `DEEPSEEK_API_KEY`, `TOGETHER_API_KEY`, `TOGETHER_API_BASE_URL`, `OPENAI_LIKE_API_KEY`,
-`OPENAI_LIKE_API_BASE_URL`, `OLLAMA_API_BASE_URL`, `LMSTUDIO_API_BASE_URL`, `PERPLEXITY_API_KEY`,
-`DEFAULT_NUM_CTX`. Set only the providers you actually use — a missing key does not fail the build.
-
-**Deploy from CI/CLI instead of Git integration** (unchanged, already correct in this repo):
-
-```bash
-pnpm run deploy        # → npm run build && wrangler pages deploy
-```
-
-`wrangler pages deploy` reads both values from `wrangler.toml`
-(`pages_build_output_dir = "./build/client"`, project name `bolt`) — no extra flags needed. Requires
-`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
-
-> **Ordering note:** `functions/[[path]].ts` imports the generated `../build/server`, so the build must
-> run *before* the Functions bundle is created — true both in the Pages pipeline and in `pnpm run deploy`.
-
-### Option B — Cloudflare **Workers** (only after the conversion in §5)
-
-Same build command (`pnpm run build`) and output directory, but the repo must first gain a Worker
-`main` entry + `[assets]` config; the default `npx wrangler deploy` deploy command then works.
+> **Ordering note (both routes):** the entry point imports the generated `../build/server`, so the build
+> must run *before* the deploy — guaranteed by `[build] command` in `wrangler.toml` and by the Pages
+> pipeline.
 
 ---
 
@@ -231,27 +239,32 @@ Same build command (`pnpm run build`) and output directory, but the repo must fi
    *every* commit in this repo. Fixed by removing the two unused declarations and applying the automated
    formatting fixes — **no behaviour change**. `pnpm run lint` now exits clean, the `pre-commit` hook
    passes, and typecheck/build/tests (31/31) were re-verified afterwards.
-6. The Pages → Workers conversion described in §5 (**not** done — it is an architectural change and
-   needs your go-ahead).
+6. The Pages → Workers conversion **is** done, in `1096ce4` (§5) — it is what the connected Worker
+   service requires. `functions/[[path]].ts` was intentionally kept, so the Pages route remains possible;
+   `git revert 1096ce4` undoes the conversion if you prefer Pages.
 
 ---
 
 ## 8. How to confirm the fix
 
-1. **Pages option:** create the Pages project as in §6 Option A (or merge this PR if a Pages project is
-   already connected) and re-run the deployment.
-2. Expected log flow — the `.tool-versions` line is **gone**:
+1. Merge this PR (`main` now needs both fixes: the `.tool-versions` removal **and** the Worker config —
+   the fix commit must not be cherry-picked alone).
+2. Watch the Workers Build for `bolt-replit`. Expected flow:
 
 ```
 Cloning repository...
 Installing dependencies...        ← no ".tool-versions" line
-...
 > bolt@0.0.3 build
 > remix vite:build
 ✓ built in ...                        ← client build
 ✓ built in ...                        ← SSR build
-Success: Build completed
+Total Upload: ~3844 KiB / gzip: ~697 KiB
+Uploaded bolt-replit ...              ← deploy step now succeeds
 ```
 
-If the run instead stops at a Workers-style deploy step, that is Problem #2 (§5) — the project type, not
-this fix.
+3. Open the Worker URL: the Bolt UI should load, `/chat/<id>` should render, `/api/models` should return
+   JSON, and `/assets/*.js` should be served from the assets directory.
+
+If anything still fails, the failing step will now be visible in the log — `.tool-versions` (Problem #1)
+and the Worker/Pages mismatch (Problem #2) are both eliminated, and the remaining variables are only
+environment-variable/provider related.
