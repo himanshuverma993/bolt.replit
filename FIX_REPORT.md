@@ -82,6 +82,12 @@ fc2dc42  docs: update FIX_REPORT with the lint fix and commit list
          workers/entry.ts | 34 +++++++++
          wrangler.toml    |  9 +++--
          2 files changed, 41 insertions(+), 2 deletions(-)   ← Problem #2 fix (§5)
+
+25bf112  docs: add Cloudflare build-log evidence and the preview-command finding
+
+bbcdb74  fix: satisfy the Workers Builds preview command (wrangler v4 + previews block)
+         package.json + pnpm-lock.yaml : wrangler ^3.91.0 -> ^4.147.0
+         wrangler.toml                 : + empty [previews] block     ← Problem #3 fix (§5)
 ```
 
 ---
@@ -235,6 +241,35 @@ satisfy the default preview command **from the repository**, it has to be done a
 upgrade `wrangler` to v4 **and** add `previews = {}` — never the block alone. The dashboard route (below)
 needs neither.
 
+### Resolution — done repo-side in `bbcdb74` (no dashboard change needed)
+
+Both halves of that coherent change are now in the repository:
+
+| File | Change |
+|------|--------|
+| `package.json` + `pnpm-lock.yaml` | `wrangler` `^3.91.0` → `^4.147.0` |
+| `wrangler.toml` | added an intentionally empty `[previews]` block (with a comment explaining why) |
+
+So the command Workers Builds runs for non-production branches (`npx wrangler preview`) now resolves to the
+current Wrangler 4 beta command, which this config satisfies. Verified on commit `bbcdb74`:
+
+| Check | Result |
+|-------|--------|
+| `pnpm run build` (with the block present, on v4) | ✅ PASS, no `Unexpected fields` warning |
+| `wrangler deploy --dry-run` | ✅ exit 0 — 329 asset files, `ASSETS` binding |
+| `wrangler versions upload --dry-run` | ✅ exit 0 |
+| `wrangler preview` | ✅ now the v4 beta command; gets past config loading and stops only at the missing `CLOUDFLARE_API_TOKEN` (Workers Builds provides it in CI) |
+| `wrangler dev` + live requests | ✅ `/` 200 (`<title>Bolt</title>`), `/chat/test-id` 200, `/api/models` 200 JSON (66 models), `/assets/*.js` 200, `/favicon.ico` 200 |
+| `pnpm run typecheck` / `test` | ✅ / ✅ 31/31 |
+
+Two pnpm peer warnings appear after the upgrade and are harmless here: `wrangler@4` wants
+`@cloudflare/workers-types@^5` (this repo pins the v4 types, and `pnpm run typecheck` passes), and
+`@remix-run/dev` declares a peer on `wrangler@^3` (dev-time proxy only — build, deploy and runtime were all
+verified above).
+
+The dashboard route remains a valid alternative, and a useful fallback if anything still reddens; it is
+described in §6.
+
 ### Verification — all on this commit
 
 | Check | Before | After |
@@ -320,24 +355,36 @@ needs neither.
 
 ## 8. How to confirm the fix
 
-1. Merge this PR (`main` now needs both fixes: the `.tool-versions` removal **and** the Worker config —
-   the fix commit must not be cherry-picked alone).
-2. Watch the Workers Build for `bolt-replit`. Expected flow:
+All three problems are now fixed in the repository, so no dashboard change is required for the build to
+succeed:
+
+1. **`.tool-versions`** — removed; the 13:47 build log already confirms the tool installer no longer runs.
+2. **Worker vs Pages mismatch** — `wrangler.toml` is a valid Worker config and the deploy command works.
+3. **Preview command** — `wrangler` is now v4 and `wrangler.toml` carries the `[previews]` block.
+
+Expected Cloudflare log flow on the next build:
 
 ```
-Cloning repository...
-Installing dependencies...        ← no ".tool-versions" line
-> bolt@0.0.3 build
+Restoring from dependencies cache
+Detected the following tools from environment: pnpm@9.4.0, nodejs@22.16.0
+Installing project dependencies: pnpm install --frozen-lockfile
+> bolt@0.0.3 prepare /opt/buildhome/repo
+> husky
+Done in ...
+Executing user build command: pnpm run build
 > remix vite:build
 ✓ built in ...                        ← client build
 ✓ built in ...                        ← SSR build
-Total Upload: ~3844 KiB / gzip: ~697 KiB
-Uploaded bolt-replit ...              ← deploy step now succeeds
+Executing user deploy command: ...
+Total Upload: ~2597 KiB / gzip: ~520 KiB
+Uploaded bolt-replit ...              ← deploy step succeeds
 ```
 
-3. Open the Worker URL: the Bolt UI should load, `/chat/<id>` should render, `/api/models` should return
-   JSON, and `/assets/*.js` should be served from the assets directory.
+Recommended (optional) dashboard settings, if you want the same guarantees outside the repo:
+Build command `pnpm run build`, Deploy command `npx wrangler deploy`, Preview command
+`npx wrangler preview` (now works) or `npx wrangler versions upload`, plus `NODE_VERSION=22.16.0` and
+`PNPM_VERSION=9.4.0` as build variables and the provider API keys as runtime variables.
 
-If anything still fails, the failing step will now be visible in the log — `.tool-versions` (Problem #1)
-and the Worker/Pages mismatch (Problem #2) are both eliminated, and the remaining variables are only
-environment-variable/provider related.
+**Reminder:** merge the branch as a whole — the Worker configuration (`1096ce4`) and the Wrangler v4
+upgrade (`bbcdb74`) depend on each other's context, and cherry-picking only the `.tool-versions` removal
+would leave the deployment broken in a different way.
