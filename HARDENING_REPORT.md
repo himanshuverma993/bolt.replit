@@ -190,23 +190,32 @@ Command: `pnpm exec vitest --run` (Node 22.22.3, pnpm 9.4.0). See §7 for the ex
 
 ## 6. Live verification
 
-Two live runs of `.github/workflows/live-verification.yml` (GitHub's network, no secrets required):
+Live runs of `.github/workflows/live-verification.yml` (GitHub's network, no secrets required):
 
-* **Production** — <https://github.com/himanshuverma993/bolt.replit/actions/runs/37203965671> (all steps green)
-* **The branch preview deployment built by Cloudflare Workers Builds** —
-  <https://github.com/himanshuverma993/bolt.replit/actions/runs/37204483345> (all steps green)
+* **Production** — <https://github.com/himanshuverma993/bolt.replit/actions/runs/37203965671> (all steps green;
+  `LIVE_OK` inference, served bundle embeds `b3b6ec4` = `main` tip, `/api/github` 404 because the route
+  ships with this PR)
+* **The branch preview deployment built by Cloudflare Workers Builds (current head)** —
+  <https://github.com/himanshuverma993/bolt.replit/actions/runs/37206510642> (all 11 steps green,
+  including the new fail-closed probe and the staleness check reporting
+  `live bundle embeds f9aaabd, the current pushed commit`)
+
+Earlier preview runs: <https://github.com/himanshuverma993/bolt.replit/actions/runs/37204483345> (10/10,
+first proof that the hardened routes answer on a live deployment) and
+<https://github.com/himanshuverma993/bolt.replit/actions/runs/37204091044> (the run that discovered the
+preview has no `env.AI` binding and produced the actionable error message quoted below).
 
 | Gate | Result | Evidence |
 |---|---|---|
 | `GET /` + asset delivery | ✅ 200, `<title>Bolt</title>`, hashed asset 200 | production run, step 3 |
 | `GET /api/models` | ✅ 200, Cloudflare provider with both `@cf/...` model ids | production run, step 4 |
 | `GET /api/mcp` | ✅ 200 | production run, step 5 |
-| `/api/github` status endpoint | ✅ 404 on production (the route is added by this PR) and **✅ 200 on the branch preview** with no token-shaped value in the payload | preview run, step 6 (404 → documented warning on production) |
+| `/api/github` status endpoint | ✅ 404 on production (the route is added by this PR) and **✅ 200 on the branch preview** with no token-shaped value in the payload | preview runs, step 6 (404 → documented warning on production) |
 | Real Workers AI inference (`env.AI.run`) | ✅ production: `POST /api/chat` → HTTP 200, AI SDK v4 data stream (`0:"..."` frames) whose concatenated text contains `LIVE_OK` | production run, step 7 |
 | Clear error when the binding is missing | ✅ the preview deployment (no `env.AI`, see §8.2) returns `Cloudflare Workers AI binding is unavailable. Add [ai] binding = "AI" to wrangler.toml and deploy the Worker with Workers AI enabled.` | preview run, step 7 |
 | Credential-shaped values in the chat error path | ✅ none (`sk-…`, `gh[pousr]_…` scan) | both runs, step 8 |
 | Credential storage fails closed without a Worker secret | ✅ preview: `POST /api/mcp` with a bearer token → HTTP 501 naming `APP_ENCRYPTION_SECRET`, credential not echoed | preview run, step 9 |
-| Deployed bundle == merged revision | ✅ the served entry bundle embeds `b3b6ec4`, the current `main` tip | production run, step 9 |
+| Deployed bundle == deployed revision | ✅ production serves `b3b6ec4` (= `main` tip); ✅ the branch preview serves the pushed commit (`f9aaabd`) | run step 10 (polls until the preview build finishes) |
 | GitHub least-privilege connection | ⚠️ partial — read-only verification, §6.2 | `github.live.spec.ts` against the real API |
 | GitHub disposable repository create/push/update | ⛔ **BLOCKED** — needs a fine-grained PAT (§6.2, §8.4) | — |
 | MCP authless / bearer | ✅ local HTTP mocks | `mcp.spec.ts` + `mcp-route.spec.ts` |
@@ -425,7 +434,7 @@ the baseline commit `b3b6ec4` prints the same message and also exits 0.
   this session.
 * Hardening commit: **`37e2df7`** — `fix(security): server-side GitHub auth, MCP OAuth and hardened credentials`
   (application code, tests, `HARDENING_REPORT.md`).
-* Deep-audit commit: **`9ddfac0`** — `fix(audit): close cookie-header, push-loss, OAuth-redirect and tool-loop gaps`
+* Deep-audit commit: **`9ddfac0`** (documented in `ba3536d`), follow-up CI commits `86d1be2`, `f9aaabd` — `fix(audit): close cookie-header, push-loss, OAuth-redirect and tool-loop gaps`
   (the findings in §10, plus their tests; see §3 for the files).
 * Follow-up commits on the branch are CI-only and touch `.github/workflows/live-verification.yml`
   exclusively: `5369666`, `8103fa9`, `26b5671`, `dcba1eb`, `efc5285`, `cff1d34`, `9f9c040`, `974b5b7`,
