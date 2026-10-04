@@ -275,9 +275,11 @@ from.
 
 ## 7. Local gate output
 
-Full log: `/tmp/evidence/final-pipeline.log` (captured with `pnpm install --frozen-lockfile`,
+Runner: `/tmp/evidence/run-gates.sh`, log: `/tmp/evidence/gates.log` (`pnpm install --frozen-lockfile`,
 `pnpm run typecheck`, `pnpm run lint`, `pnpm exec vitest --run`, `pnpm run build`,
-`npx wrangler deploy --dry-run`).
+`npx wrangler deploy --dry-run`; exit codes captured per step with `set -o pipefail`). The table below
+was reproduced at the final commit (`956823f`) with identical results — app code is unchanged since
+`37e2df7`, only the live-verification workflow and this report changed afterwards.
 
 Baseline (before changes, commit `b3b6ec4`): install ✅, typecheck ✅, lint ✅, tests 44/44 ✅,
 build ✅, `wrangler deploy --dry-run` ✅ (3.84 MiB bundle, 329 assets).
