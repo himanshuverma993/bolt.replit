@@ -160,3 +160,26 @@ jobs:
             exit 1
           fi
           echo 'no credential-shaped values in the error response'
+
+      - name: Deployed bundle embeds the deployed commit (staleness check)
+        run: |
+          set -uo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          entry=$(grep -o '/assets/index-[^"]*\.js' /tmp/home.html | head -1)
+          echo "entry asset: $entry"
+          curl -sS --max-time 60 -o /tmp/entry.js "$BASE$entry"
+          git fetch --depth=1 origin main:refs/remotes/origin/main >/dev/null 2>&1 || true
+          main_short=$(git rev-parse --short origin/main 2>/dev/null || echo unknown)
+          markers=$(node -e '
+            const s = require("fs").readFileSync("/tmp/entry.js", "utf8");
+            const set = new Set();
+            for (const m of s.match(/"[0-9a-f]{7}"/g) || []) set.add(m.replace(/"/g, ""));
+            console.log([...set].slice(0, 8).join(",") || "none");
+          ')
+          echo "commit-looking markers in the entry bundle: $markers"
+          echo "origin/main short hash: $main_short"
+          if echo ",$markers," | grep -q ",$main_short,"; then
+            echo "::notice::live bundle embeds $main_short, the origin/main tip - the deployment is built from the merged main revision"
+          else
+            echo "::warning::live bundle does not embed the current origin/main tip ($main_short); markers=$markers"
+          fi
