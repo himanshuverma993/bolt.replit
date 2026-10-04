@@ -186,6 +186,16 @@ function isCompleteJson(text: string): boolean {
 }
 
 /**
+ * An empty JSON object is what Workers AI sends when it opens a call before the
+ * arguments exist, so it does not count as "this call already has arguments".
+ */
+function hasArguments(text: string): boolean {
+  const trimmed = text.trim();
+
+  return trimmed.length > 0 && trimmed !== '{}';
+}
+
+/**
  * A fully accumulated tool call becomes an AI SDK v1 part. Valid JSON is passed
  * through untouched so the SDK parses exactly what the model produced; an
  * interrupted or empty fragment falls back to `{}` rather than handing the SDK
@@ -273,7 +283,7 @@ function streamWorkersResponse(response: ReadableStream<Uint8Array>): ReadableSt
       let completionTokens = 0;
       let finishReason: 'stop' | 'tool-calls' = 'stop';
       const emittedToolCalls = new Set<string>();
-      const streamedToolCalls = new Map<number, { id: string; name: string; argumentText: string }>();
+      const pendingToolCalls = new Map<number, { id: string; name: string; argumentText: string }>();
 
       const emitToolCall = (call: { id: string; name: string; argumentText: string }) => {
         if (emittedToolCalls.has(call.id)) {
@@ -286,13 +296,52 @@ function streamWorkersResponse(response: ReadableStream<Uint8Array>): ReadableSt
       };
 
       /**
-       * Accumulates OpenAI-style fragments until the arguments form complete
-       * JSON, then emits the call. Fragments that never complete are flushed
-       * when the stream ends so a truncated call is still surfaced.
+       * A native entry that already carries arguments is a complete call, so it
+       * can be emitted immediately. One that carries none may be the opening
+       * frame of a streamed call (the arguments arrive as `choices[]` deltas
+       * afterwards), so it is only recorded - emitting it right away was how a
+       * call ended up with `args: {}` and a remote MCP tool rejected it.
        */
-      const accumulateToolCall = (fragment: WorkersAiDeltaToolCall) => {
-        const index = typeof fragment.index === 'number' ? fragment.index : streamedToolCalls.size;
-        const call = streamedToolCalls.get(index) ?? { id: `cloudflare-tool-${index}`, name: '', argumentText: '' };
+      const recordNativeToolCall = (toolCall: WorkersAiToolCall) => {
+        if (!toolCall.name) {
+          return;
+        }
+
+        const index = nativeToolCallIndex;
+        nativeToolCallIndex += 1;
+
+        const call = pendingToolCalls.get(index) ?? {
+          id: `cloudflare-tool-${index}`,
+          name: '',
+          argumentText: '',
+        };
+        const argumentText = toArgumentText(toolCall.arguments);
+
+        call.name = toolCall.name;
+
+        pendingToolCalls.set(index, call);
+
+        if (hasArguments(argumentText)) {
+          call.argumentText = argumentText;
+          emitToolCall(call);
+        }
+      };
+
+      /**
+       * Streamed arguments are accumulated and never emitted early: a fragment
+       * can always be continued, and Workers AI opens a call with markers such
+       * as `""`, `"{}"` or `{}` before the real arguments arrive. Emitting on
+       * the first marker (or the first chunk that parses as JSON) drops every
+       * later fragment - the second half of the `args: {}` bug. Anything left
+       * pending is emitted once the stream ends, still before `finish`.
+       */
+      const recordDeltaToolCall = (fragment: WorkersAiDeltaToolCall) => {
+        const index = typeof fragment.index === 'number' ? fragment.index : pendingToolCalls.size;
+        const call = pendingToolCalls.get(index) ?? {
+          id: `cloudflare-tool-${index}`,
+          name: '',
+          argumentText: '',
+        };
         const name = fragment.function?.name ?? fragment.name;
 
         if (typeof name === 'string' && name.length > 0) {
@@ -302,17 +351,21 @@ function streamWorkersResponse(response: ReadableStream<Uint8Array>): ReadableSt
         const args = fragment.function?.arguments ?? fragment.arguments;
 
         if (typeof args === 'string') {
+          /**
+           * Workers AI opens a streamed call with markers - an empty string, or a
+           * `"{}"` literal before the real arguments arrive. Neither is an argument.
+           */
+          if (call.argumentText === '{}') {
+            call.argumentText = '';
+          }
+
           call.argumentText += args;
-        } else if (args !== undefined && args !== null) {
-          // A non-string value can only be a fully materialised argument object.
+        } else if (args && typeof args === 'object' && Object.keys(args).length > 0) {
+          // A non-empty object can only be a fully materialised argument value.
           call.argumentText = toArgumentText(args);
         }
 
-        streamedToolCalls.set(index, call);
-
-        if (call.name.length > 0 && isCompleteJson(call.argumentText)) {
-          emitToolCall(call);
-        }
+        pendingToolCalls.set(index, call);
       };
 
       const emit = (result: WorkersAiResult) => {
@@ -326,21 +379,12 @@ function streamWorkersResponse(response: ReadableStream<Uint8Array>): ReadableSt
         completionTokens = result.usage?.completion_tokens ?? completionTokens;
 
         for (const toolCall of result.tool_calls ?? []) {
-          if (!toolCall.name) {
-            continue;
-          }
-
-          emitToolCall({
-            id: `cloudflare-tool-${nativeToolCallIndex}`,
-            name: toolCall.name,
-            argumentText: toArgumentText(toolCall.arguments),
-          });
-          nativeToolCallIndex += 1;
+          recordNativeToolCall(toolCall);
         }
 
         for (const choice of result.choices ?? []) {
           for (const fragment of choice.delta?.tool_calls ?? []) {
-            accumulateToolCall(fragment);
+            recordDeltaToolCall(fragment);
           }
         }
       };
@@ -380,7 +424,7 @@ function streamWorkersResponse(response: ReadableStream<Uint8Array>): ReadableSt
           buffer.split(/\r?\n/).forEach(consumeLine);
         }
 
-        for (const call of streamedToolCalls.values()) {
+        for (const call of pendingToolCalls.values()) {
           if (call.name.length > 0) {
             emitToolCall(call);
           }
