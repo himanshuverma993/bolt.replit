@@ -15,12 +15,42 @@ type WorkersAiTool = {
   };
 };
 
-type WorkersAiResult = {
-  response?: string;
-  tool_calls?: Array<{
+type WorkersAiToolCall = {
+  name?: string;
+  arguments?: unknown;
+};
+
+/**
+ * Workers AI streams tool calls in two shapes, and a chunk can carry both:
+ *
+ *  - the native binding shape: `{ response, tool_calls: [{ name, arguments }] }`
+ *  - the OpenAI-compatible shape: `{ choices: [{ delta: { content, tool_calls } }] }`
+ *    where a single call arrives as fragments - the name and the id in one
+ *    chunk, the JSON arguments spread over the following ones.
+ *
+ * Reading only the native field loses the arguments (the call is emitted with
+ * `{}`), which is exactly what production showed against a remote MCP tool, so
+ * both shapes are merged here.
+ */
+type WorkersAiDeltaToolCall = {
+  index?: number;
+  name?: string;
+  arguments?: unknown;
+  function?: {
     name?: string;
     arguments?: unknown;
-  }>;
+  };
+};
+
+type WorkersAiChoice = {
+  message?: { content?: string; tool_calls?: WorkersAiToolCall[] };
+  delta?: { content?: string; tool_calls?: WorkersAiDeltaToolCall[] };
+};
+
+type WorkersAiResult = {
+  response?: string;
+  tool_calls?: WorkersAiToolCall[];
+  choices?: WorkersAiChoice[];
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
@@ -138,19 +168,76 @@ function toWorkersTools(options: LanguageModelV1CallOptions): WorkersAiTool[] | 
   return tools;
 }
 
-function makeToolCall(toolCall: { name?: string; arguments?: unknown }, index: number) {
-  const toolName = toolCall.name;
-
-  if (!toolName) {
-    return undefined;
+function toArgumentText(value: unknown): string {
+  if (value === undefined || value === null) {
+    return '';
   }
+
+  return typeof value === 'string' ? value : JSON.stringify(value);
+}
+
+function isCompleteJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A fully accumulated tool call becomes an AI SDK v1 part. Valid JSON is passed
+ * through untouched so the SDK parses exactly what the model produced; an
+ * interrupted or empty fragment falls back to `{}` rather than handing the SDK
+ * JSON it cannot parse (the tool then reports the missing arguments itself).
+ */
+function makeToolCall(call: { id: string; name: string; argumentText: string }) {
+  const trimmed = call.argumentText.trim();
 
   return {
     toolCallType: 'function' as const,
-    toolCallId: `cloudflare-tool-${index}`,
-    toolName,
-    args: typeof toolCall.arguments === 'string' ? toolCall.arguments : JSON.stringify(toolCall.arguments ?? {}),
+    toolCallId: call.id,
+    toolName: call.name,
+    args: trimmed.length > 0 && isCompleteJson(trimmed) ? trimmed : '{}',
   };
+}
+
+/**
+ * Workers AI sends a streamed token in both `response` and
+ * `choices[].delta.content` on the same chunk, so the native field wins and the
+ * token is not rendered twice.
+ */
+function getChunkText(result: WorkersAiResult): string | undefined {
+  if (typeof result.response === 'string' && result.response.length > 0) {
+    return result.response;
+  }
+
+  const parts = (result.choices ?? [])
+    .map((choice) => choice.delta?.content)
+    .filter((content): content is string => typeof content === 'string' && content.length > 0);
+
+  return parts.length > 0 ? parts.join('') : undefined;
+}
+
+function getResultText(result: WorkersAiResult): string {
+  if (typeof result.response === 'string' && result.response.length > 0) {
+    return result.response;
+  }
+
+  return (result.choices ?? [])
+    .map((choice) => choice.message?.content)
+    .filter((content): content is string => typeof content === 'string')
+    .join('');
+}
+
+function getResultToolCalls(result: WorkersAiResult): WorkersAiToolCall[] {
+  const calls = [...(result.tool_calls ?? [])];
+
+  for (const choice of result.choices ?? []) {
+    calls.push(...(choice.message?.tool_calls ?? []));
+  }
+
+  return calls;
 }
 
 function getUsage(result: WorkersAiResult) {
@@ -181,26 +268,79 @@ function streamWorkersResponse(response: ReadableStream<Uint8Array>): ReadableSt
       const decoder = new TextDecoder();
       let buffer = '';
       let bytesRead = 0;
-      let toolCallIndex = 0;
+      let nativeToolCallIndex = 0;
       let promptTokens = 0;
       let completionTokens = 0;
+      let finishReason: 'stop' | 'tool-calls' = 'stop';
       const emittedToolCalls = new Set<string>();
+      const streamedToolCalls = new Map<number, { id: string; name: string; argumentText: string }>();
+
+      const emitToolCall = (call: { id: string; name: string; argumentText: string }) => {
+        if (emittedToolCalls.has(call.id)) {
+          return;
+        }
+
+        emittedToolCalls.add(call.id);
+        finishReason = 'tool-calls';
+        controller.enqueue({ type: 'tool-call', ...makeToolCall(call) });
+      };
+
+      /**
+       * Accumulates OpenAI-style fragments until the arguments form complete
+       * JSON, then emits the call. Fragments that never complete are flushed
+       * when the stream ends so a truncated call is still surfaced.
+       */
+      const accumulateToolCall = (fragment: WorkersAiDeltaToolCall) => {
+        const index = typeof fragment.index === 'number' ? fragment.index : streamedToolCalls.size;
+        const call = streamedToolCalls.get(index) ?? { id: `cloudflare-tool-${index}`, name: '', argumentText: '' };
+        const name = fragment.function?.name ?? fragment.name;
+
+        if (typeof name === 'string' && name.length > 0) {
+          call.name = name;
+        }
+
+        const args = fragment.function?.arguments ?? fragment.arguments;
+
+        if (typeof args === 'string') {
+          call.argumentText += args;
+        } else if (args !== undefined && args !== null) {
+          // A non-string value can only be a fully materialised argument object.
+          call.argumentText = toArgumentText(args);
+        }
+
+        streamedToolCalls.set(index, call);
+
+        if (call.name.length > 0 && isCompleteJson(call.argumentText)) {
+          emitToolCall(call);
+        }
+      };
 
       const emit = (result: WorkersAiResult) => {
-        if (result.response) {
-          controller.enqueue({ type: 'text-delta', textDelta: result.response });
+        const text = getChunkText(result);
+
+        if (text) {
+          controller.enqueue({ type: 'text-delta', textDelta: text });
         }
 
         promptTokens = result.usage?.prompt_tokens ?? promptTokens;
         completionTokens = result.usage?.completion_tokens ?? completionTokens;
 
         for (const toolCall of result.tool_calls ?? []) {
-          const parsed = makeToolCall(toolCall, toolCallIndex);
+          if (!toolCall.name) {
+            continue;
+          }
 
-          if (parsed && !emittedToolCalls.has(parsed.toolCallId)) {
-            emittedToolCalls.add(parsed.toolCallId);
-            toolCallIndex += 1;
-            controller.enqueue({ type: 'tool-call', ...parsed });
+          emitToolCall({
+            id: `cloudflare-tool-${nativeToolCallIndex}`,
+            name: toolCall.name,
+            argumentText: toArgumentText(toolCall.arguments),
+          });
+          nativeToolCallIndex += 1;
+        }
+
+        for (const choice of result.choices ?? []) {
+          for (const fragment of choice.delta?.tool_calls ?? []) {
+            accumulateToolCall(fragment);
           }
         }
       };
@@ -240,9 +380,15 @@ function streamWorkersResponse(response: ReadableStream<Uint8Array>): ReadableSt
           buffer.split(/\r?\n/).forEach(consumeLine);
         }
 
+        for (const call of streamedToolCalls.values()) {
+          if (call.name.length > 0) {
+            emitToolCall(call);
+          }
+        }
+
         controller.enqueue({
           type: 'finish',
-          finishReason: toolCallIndex > 0 ? 'tool-calls' : 'stop',
+          finishReason,
           usage: { promptTokens, completionTokens },
         });
         controller.close();
@@ -311,12 +457,20 @@ function createModel(serverEnv: Env, model: string): LanguageModelV1 {
 
     async doGenerate(options) {
       const result = getResult(await getBinding().run(model, getWorkersInput(options, false)));
-      const toolCalls = (result.tool_calls ?? [])
-        .map((toolCall, index) => makeToolCall(toolCall, index))
+      const toolCalls = getResultToolCalls(result)
+        .map((toolCall, index) =>
+          toolCall.name
+            ? makeToolCall({
+                id: `cloudflare-tool-${index}`,
+                name: toolCall.name,
+                argumentText: toArgumentText(toolCall.arguments),
+              })
+            : undefined,
+        )
         .filter((toolCall): toolCall is NonNullable<typeof toolCall> => !!toolCall);
 
       return {
-        text: result.response,
+        text: getResultText(result),
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
         finishReason: toolCalls.length > 0 ? 'tool-calls' : 'stop',
         usage: getUsage(result),

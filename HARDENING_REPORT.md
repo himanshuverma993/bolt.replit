@@ -849,6 +849,94 @@ The new logic was behaviour-tested with a stubbed `curl` before shipping: deploy
 embeds <sha>` and the assertion proceeds; not deployed on a production run -> warning + notice + exit 0; not
 deployed on a branch run -> immediate notice and no waiting.
 
+### 12.3e The tools-enabled assertion, second iteration: gate on the stream, report the wording
+
+After the race fix, the next `main` run (`37217339645`) reached the assertion itself - the wait had confirmed
+the served bundle embedded `313c995`, the MCP server connected with tools, and `/api/chat` answered `200`
+without any MCP or binding error. The step then failed on its last line:
+
+```
+[failure] the tools-enabled chat did not answer with TOOLS_OK
+```
+
+That is a statement about **the model's wording**, not about the wiring, and it is the wrong thing to gate a
+merge on: an 8B model with a real tool list may call the tool, answer in its own words, or (as the no-tools
+probe shows) write a Bolt artifact. The step now:
+
+* gates on what must hold - HTTP 200, no MCP/Workers AI error text, no `3:` error frame, and a stream that
+  carries at least one text or tool-call frame;
+* reports the model's actual behaviour in the annotation instead of hiding it: the frame counts
+  (`text`, `toolCall`, `toolResult`, `error`) and the first 160 characters of the answer, with `TOOLS_OK`
+  reported as a notice when the model does say it and a warning when it does not;
+* asks the model to use the tool and then answer, so a successful run documents the tool loop.
+
+The six cases were behaviour-tested against canned streams before shipping: plain `TOOLS_OK`, an artifact
+containing it, a tool call + result + answer, an empty stream (`empty_stream`), an error frame
+(`error_frame`, carrying the message) and a plausible answer without `TOOLS_OK` (passes with a warning).
+
+### 12.3f The tools-enabled chat, third iteration: the model, not the wiring
+
+The instrumented branch run (`37217682385`) finally showed what production actually sends back, and the
+answer is a model behaviour, not a defect:
+
+```
+[notice] production runs a tools-enabled chat with a real remote MCP server and Workers AI (ok)
+[warning] the model did not answer TOOLS_OK; the stream is still well formed
+          (text=26 toolCall=0 toolResult=0)
+          :: {"name": "mcp_cf-docs-tools_search_cloudflare_documentation", "parameters": {"query": "Workers AI"}}
+```
+
+`@cf/meta/llama-3.1-8b-instruct-fp8` **confabulated the call**: it wrote the tool-call JSON into its text
+instead of emitting `tool_calls`, so the AI SDK never saw a tool call (`toolCall=0`). Workers AI's own model
+catalogue settles the point - `llama-3.3-70b-instruct-fp8-fast` is listed with *Function calling: Yes*, and
+the 8B is the model small enough to confabulate instead of invoking. The probe therefore now asks the
+**tool-capable model the provider already exposes** (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`), and reports a
+notice when the loop really runs (`production executed an MCP tool inside a Workers AI chat`, with the frame
+counts). The stream-health gates are unchanged.
+
+This is also the honest answer to "does the Cloudflare connection work with MCP tools?": the wiring does - the
+tool schema reaches the model, the stream is well formed and error-free on production - but whether a tool is
+invoked depends on the model's function-calling ability, and the smallest Workers AI models are poor at it.
+
+### 12.3g The real production defect the annotations exposed: fragmented tool-call arguments
+
+The instrumented branch run did more than explain a failure - it surfaced a genuine adapter bug.
+
+```
+9:{"toolCallId":"cloudflare-tool-0","toolName":"mcp_cf-docs-tools_search_cloudflare_documentation","args":{}}
+a:{"toolCallId":"cloudflare-tool-0","result":{"server":"cf-docs-tools","tool":"search_clou...
+```
+
+The tool call reached the model list and came back, but with **empty arguments**, so the remote MCP tool
+rejected the invocation. Root cause, in `app/lib/modules/llm/providers/cloudflare.ts`:
+
+* Workers AI streams a tool call in **two shapes**, and a chunk can carry both. The native binding shape is
+  `{ response, tool_calls: [{ name, arguments }] }`; the OpenAI-compatible shape is
+  `{ choices: [{ delta: { content, tool_calls } }] }`, where the call id/name arrive in one chunk and the JSON
+  arguments arrive as **string fragments across the following chunks** (documented in Cloudflare's Workers AI
+  function-calling docs; the same split is reported for the binding in `alchemy-run/alchemy#1907`).
+* The adapter read only the native `tool_calls` array, emitted a call on the **first** frame that carried a name,
+  and then discarded every later frame for that same call. Fragment arguments were therefore never seen, and the
+  call was emitted with `args: {}`.
+* The same bug is why `llama-3.1-8b` looked like it "confabulated": it never got the fragments either.
+
+The fix accumulates fragments per call index until the arguments form complete JSON, emits the call exactly once,
+and flushes a truncated call at the end of the stream instead of dropping it. Text is de-duplicated because
+Workers AI sends the same streamed token in both shapes on one chunk (native field wins). The non-streaming path
+now also accepts `choices[].message.tool_calls` / `choices[].message.content`, and a chunk that carries only
+`choices[].delta.content` (no `response`) still streams text.
+
+Evidence:
+
+* `app/lib/modules/llm/providers/cloudflare-tool-arguments.spec.ts` - seven tests: fragment accumulation into one
+  complete call, early emission before the stream ends, no double-rendered tokens, OpenAI-only text streaming,
+  truncated-call flush, the native shape still working, and a full `streamText` tool loop whose executor receives
+  `{ query: "Workers AI" }` and whose follow-up request carries `tool_call_id: cloudflare-tool-0`.
+* The live probe now prints the streamed arguments in its annotation
+  (`production streamed a tool call with arguments (... args={"query":"Workers AI"})`), so the next deployment's
+  annotations prove the fix end to end; the parser was behaviour-tested against six canned streams
+  (tool call with args, fragment-only frames, empty stream, error frame, plain answer, confabulated text).
+
 ### 12.4 Commits and live runs of this pass
 
 | Commit | Subject |
