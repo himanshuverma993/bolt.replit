@@ -381,7 +381,11 @@ jobs:
           if [ "$state" != "connected" ]; then
             stop "the production MCP tool path is not usable from the deployed build ($state)"
           fi
-          payload=$(node -e 'process.stdout.write(JSON.stringify({messages:[{role:"user",content:"[Model: @cf/meta/llama-3.1-8b-instruct-fp8]\n\n[Provider: Cloudflare]\n\nUse the available MCP tool to look up Workers AI in the Cloudflare documentation, then reply with exactly TOOLS_OK"}],files:{}}))')
+          # The 8B model does not support function calling reliably - in a live run it
+          # wrote the call into its text instead of emitting tool_calls - so this probe
+          # uses the tool-capable model the provider already exposes
+          # (@cf/meta/llama-3.3-70b-instruct-fp8-fast, "Function calling: Yes").
+          payload=$(node -e 'process.stdout.write(JSON.stringify({messages:[{role:"user",content:"[Model: @cf/meta/llama-3.3-70b-instruct-fp8-fast]\n\n[Provider: Cloudflare]\n\nUse the available MCP tool to look up Workers AI in the Cloudflare documentation, then reply with exactly TOOLS_OK"}],files:{}}))')
           code=$(curl -sS --max-time 180 -o /tmp/chat-tools.out -w '%{http_code}' -X POST "$BASE/api/chat" \
             -H 'Content-Type: application/json' -b /tmp/tools.jar --data-binary "$payload") || code=000
           echo "POST /api/chat (MCP tools enabled) -> $code"
@@ -433,6 +437,9 @@ jobs:
             }
             fs.writeFileSync("/tmp/tools.state", "ok");
             const text = fs.readFileSync("/tmp/tools.text", "utf8");
+            if (frames.toolResult > 0) {
+              console.log(`::notice::production executed an MCP tool inside a Workers AI chat (${note})`);
+            }
             if (text.toLowerCase().includes("tools_ok")) {
               console.log(`::notice::the tools-enabled chat answered TOOLS_OK, so the MCP tool list reached the model (${note})`);
             } else {

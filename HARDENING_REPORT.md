@@ -874,6 +874,30 @@ The six cases were behaviour-tested against canned streams before shipping: plai
 containing it, a tool call + result + answer, an empty stream (`empty_stream`), an error frame
 (`error_frame`, carrying the message) and a plausible answer without `TOOLS_OK` (passes with a warning).
 
+### 12.3f The tools-enabled chat, third iteration: the model, not the wiring
+
+The instrumented branch run (`37217682385`) finally showed what production actually sends back, and the
+answer is a model behaviour, not a defect:
+
+```
+[notice] production runs a tools-enabled chat with a real remote MCP server and Workers AI (ok)
+[warning] the model did not answer TOOLS_OK; the stream is still well formed
+          (text=26 toolCall=0 toolResult=0)
+          :: {"name": "mcp_cf-docs-tools_search_cloudflare_documentation", "parameters": {"query": "Workers AI"}}
+```
+
+`@cf/meta/llama-3.1-8b-instruct-fp8` **confabulated the call**: it wrote the tool-call JSON into its text
+instead of emitting `tool_calls`, so the AI SDK never saw a tool call (`toolCall=0`). Workers AI's own model
+catalogue settles the point - `llama-3.3-70b-instruct-fp8-fast` is listed with *Function calling: Yes*, and
+the 8B is the model small enough to confabulate instead of invoking. The probe therefore now asks the
+**tool-capable model the provider already exposes** (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`), and reports a
+notice when the loop really runs (`production executed an MCP tool inside a Workers AI chat`, with the frame
+counts). The stream-health gates are unchanged.
+
+This is also the honest answer to "does the Cloudflare connection work with MCP tools?": the wiring does - the
+tool schema reaches the model, the stream is well formed and error-free on production - but whether a tool is
+invoked depends on the model's function-calling ability, and the smallest Workers AI models are poor at it.
+
 ### 12.4 Commits and live runs of this pass
 
 | Commit | Subject |
