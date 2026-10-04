@@ -828,11 +828,23 @@ workerd harness asserts execution and the approval gate.
 | `2378c03` | test(ui): pin the Cloudflare keyless provider panel; record the new live notice |
 | `1053522` | docs: record the live result of the new OAuth-only MCP assertion (run `37212261741`) |
 | `8577051` | test(llm): pin the MCP tool-loop wiring in stream-text |
+| `ccbdf95` | docs: record the third-pass commits and live runs |
+| `475c3f4` | test(ci): extend the workerd smoke test to four runtime-only flows |
+| `1d63ee0` | test(store): pin the GitHub push path behind the Push to GitHub button |
+| `fe6c528` | test(ci): execute MCP tools/call and the approval gate in workerd |
+| `789e6d8` | test(live): assert the non-existent-repo path against the real API and add the tools-enabled chat step |
+| `e1329db` | test(live): run the tools-enabled chat probe on branch runs too, as a notice |
 
-Live runs at this pass's heads, all green: `37212261741` (`13ad226`, 13/13 steps incl. the new OAuth-only
-assertion) and `37212915553` (`8577051`, 13/13 steps, `live bundle embeds 8577051`). Local gates at
-`8577051`: install / `tsc` / `eslint` / vitest (175 passed, 6 opt-in skips) / build / `wrangler deploy --dry-run`
-= 6/6 exit 0.
+Live runs, all green at their heads: `37212261741` (`13ad226`, 13 steps incl. the OAuth-only assertion),
+`37212915553` (`8577051`, 13 steps), `37213108110` (`ccbdf95`), `37213734697` (`475c3f4`),
+`37214000781`→`37214002364` (`1d63ee0`), `37214883586` (`fe6c528`), `37215369045` (`789e6d8`) and
+`37215634307` (`e1329db`, 14 steps). The latest two include the new notice
+`the production MCP tool path is not usable from the deployed build (not_connected)`, which becomes a strict
+assertion once this branch is merged to `main`.
+
+Final local state at `e1329db`: install / `tsc` / `eslint` / vitest (180 passed, 8 opt-in skips) / build /
+`wrangler deploy --dry-run` = 6/6 exit 0, plus the workerd smoke test (`[smoke] OK`, six checks). The working
+tree is clean and the branch is pushed.
 
 Also corrected in this pass: the PR body was being updated through `gh pr edit`, which aborts on this
 repository with a GraphQL `Projects (classic)` deprecation error while still exiting non-zero, so the body had
