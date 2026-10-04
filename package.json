@@ -54,6 +54,7 @@
     "@iconify-json/ph": "^1.2.1",
     "@iconify-json/svg-spinners": "^1.2.1",
     "@lezer/highlight": "^1.2.1",
+    "@modelcontextprotocol/sdk": "1.32.0",
     "@nanostores/react": "^0.7.3",
     "@octokit/rest": "^21.0.2",
     "@octokit/types": "^13.6.2",
@@ -127,7 +128,7 @@
     "vite-tsconfig-paths": "^4.3.2",
     "vitest": "^2.1.7",
     "wrangler": "^4.147.0",
-    "zod": "^3.23.8"
+    "zod": "^3.25.76"
   },
   "resolutions": {
     "@typescript-eslint/utils": "^8.0.0-alpha.30"

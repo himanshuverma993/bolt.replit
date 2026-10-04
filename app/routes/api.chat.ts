@@ -1,6 +1,7 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { createDataStream } from 'ai';
 import { MAX_RESPONSE_SEGMENTS, MAX_TOKENS } from '~/lib/.server/llm/constants';
+import { getErrorMessage } from '~/lib/.server/llm/get-error-message';
 import { CONTINUE_PROMPT } from '~/lib/common/prompts/prompts';
 import { streamText, type Messages, type StreamingOptions } from '~/lib/.server/llm/stream-text';
 import SwitchableStream from '~/lib/.server/llm/switchable-stream';
@@ -100,9 +101,10 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           files,
           providerSettings,
           promptId,
+          request,
         });
 
-        return stream.switchSource(result.toDataStream());
+        return stream.switchSource(result.toDataStream({ getErrorMessage }));
       },
     };
 
@@ -114,9 +116,10 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
       files,
       providerSettings,
       promptId,
+      request,
     });
 
-    stream.switchSource(result.toDataStream());
+    stream.switchSource(result.toDataStream({ getErrorMessage }));
 
     return new Response(stream.readable, {
       status: 200,
@@ -124,17 +127,17 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
         contentType: 'text/plain; charset=utf-8',
       },
     });
-  } catch (error: any) {
-    console.error(error);
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
 
-    if (error.message?.includes('API key')) {
+    if (message.includes('API key')) {
       throw new Response('Invalid or missing API key', {
         status: 401,
         statusText: 'Unauthorized',
       });
     }
 
-    throw new Response(null, {
+    throw new Response(message, {
       status: 500,
       statusText: 'Internal Server Error',
     });

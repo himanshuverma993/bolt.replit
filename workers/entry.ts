@@ -19,7 +19,7 @@ const handleRequest = createRequestHandler(serverBuild as unknown as ServerBuild
  * a `default` cache that the Workers runtime does not have.
  */
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const cloudflare = {
       env,
       cf: request.cf,
@@ -27,6 +27,14 @@ export default {
       caches,
     } as unknown as AppLoadContext['cloudflare'];
 
-    return handleRequest(request, { cloudflare });
+    const response = await handleRequest(request, { cloudflare });
+
+    if (response.status !== 404) {
+      return response;
+    }
+
+    const assetResponse = await env.ASSETS.fetch(request);
+
+    return assetResponse.status === 404 ? response : assetResponse;
   },
 };
