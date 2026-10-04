@@ -725,7 +725,17 @@ dependencies were added for this: `@testing-library/react` 16.3.3 + `@testing-li
    body was executed against canned responses: `auth_required/http_401` -> notice + exit 0,
    `connected` with tools -> exit 2, `error/unknown` -> exit 4, `error` with no code -> exit 4,
    `error/http_403` -> notice + exit 0. All 13 `run:` blocks still pass `bash -n` and the workflow YAML
-   still parses (13 steps).
+   still parses (13 steps). It then passed for real on the first live run at `13ad226`
+   (run `37212261741`), whose annotations include:
+
+```
+[notice] the OAuth-only MCP server was refused and classified as auth_required / http_401
+[notice] real remote MCP server connected with 2 discovered tool(s): search_cloudflare_documentation, migrate_pages_to_workers_guide
+[notice] GitHub token storage fails closed without a Worker secret (HTTP 501) and the token was not echoed
+[notice] both Cloudflare Workers AI model ids answered through the production deployment without an API key
+[notice] forged MCP OAuth callback rejected with reason=missing_state_cookie
+[notice] live bundle embeds 13ad226, the current pushed commit - the deployment is built from that revision
+```
 
 | `app/components/chat/APIKeyManager.spec.ts` (3 tests) | The provider key panel: the Cloudflare provider is rendered as "no API key needed - runs on your Cloudflare account's Workers AI free tier" with no edit affordance; a keyed provider still masks a stored key and saves an edit through `setApiKey`; an unset key is not presented as an error | 3 passed |
 
