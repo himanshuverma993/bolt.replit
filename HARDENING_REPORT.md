@@ -818,6 +818,37 @@ project's wrangler.
 The output cap is still only covered on Node (`mcp.spec.ts`), because the mock returns a small payload; the
 workerd harness asserts execution and the approval gate.
 
+### 12.3d Post-merge finding: the new step raced the deploy (fixed)
+
+PR #3 was merged as `8465e2e`. The first live-verification run on `main` (`37216579930`) **failed**, and the
+failure was exactly the new step:
+
+```
+[failure] the production MCP tool path is not usable from the deployed build (not_connected)
+```
+
+Diagnosis, from the run's own evidence rather than assumption:
+
+* `Workers Builds: bolt-replit` for `8465e2e` was still `in_progress` while that run executed, and it only
+  reached `completed/success` about a minute later. The step therefore talked to the **previous** production
+  build - the one that predates the MCP/workerd fix - whose `/api/mcp` add legitimately reports `not_connected`.
+* Every other step in that run behaved: the two Cloudflare model ids answered, the Workers AI chat probe
+  returned `LIVE_OK`, credential storage failed closed, and steps 12-15 were skipped only because step 11
+  aborted the job.
+
+So this was a race in the step I added minutes earlier, not a defect in the merged code: it asserted deploy
+lag as if it were a product failure. The fix (`.github/workflows/live-verification.yml`):
+
+* A production run now waits (bounded, 8 x 30s) for the served bundle to embed the pushed commit before it
+  asserts. If the deployment never catches up, the step emits a `::warning::` naming the served markers and
+  exits 0 - the staleness step is the one that watches for a deployment that never catches up.
+* A branch run never waits (production will not serve that revision): it says so and probes the production
+  deployment as a best-effort signal, keeping the branch feedback loop fast.
+
+The new logic was behaviour-tested with a stubbed `curl` before shipping: deployed -> `the served bundle
+embeds <sha>` and the assertion proceeds; not deployed on a production run -> warning + notice + exit 0; not
+deployed on a branch run -> immediate notice and no waiting.
+
 ### 12.4 Commits and live runs of this pass
 
 | Commit | Subject |
