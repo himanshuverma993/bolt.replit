@@ -1,6 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createGitHubClient, pushProjectToGitHub, verifyGitHubToken, type GitHubConnection } from './github';
 
+/*
+ * The route handlers are imported here (not in app/routes) so Remix does not
+ * expose a spec file as a route.
+ */
+import { action, loader } from '~/routes/api.github';
+
 /**
  * Live GitHub integration test.
  *
@@ -118,4 +124,128 @@ afterAll(async () => {
       }`,
     );
   }
+});
+
+/**
+ * Route-level live suite: drives the real Remix route handlers against the real
+ * GitHub API. Read-only - the only write it attempts is a repository creation
+ * and that attempt is skipped unless the token provably cannot create
+ * repositories (installation tokens never can), so nothing is ever written.
+ */
+describeLive('live GitHub route (read-only)', () => {
+  const SECRET = 'live-route-test-secret-32-characters';
+  const contextFor = (env: Record<string, unknown>) =>
+    ({ cloudflare: { env } }) as unknown as Parameters<typeof action>[0]['context'];
+  const post = (body: unknown, cookie?: string) =>
+    new Request('https://bolt.example.test/api/github', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
+      body: JSON.stringify(body),
+    });
+
+  it('connects, reports status and refuses a repository creation from the UI route', async () => {
+    const connect = await action({
+      request: post({ action: 'connect', token: token!, repo: probeRepo }),
+      context: contextFor({ APP_ENCRYPTION_SECRET: SECRET }),
+    } as unknown as Parameters<typeof action>[0]);
+    const connected = (await connect.json()) as Record<string, unknown>;
+    const cookies = connect.headers.getSetCookie();
+    const session = cookies.find((cookie) => cookie.startsWith('gh_session='))!;
+
+    expect(connect.status).toBe(200);
+    expect(connected.connected).toBe(true);
+    expect(connected.login).toBeTruthy();
+    expect(connected.tokenKind).toBe('installation');
+    expect(connected.repoCreate).not.toBe('allowed');
+    expect(session).toContain('HttpOnly');
+    expect(session).not.toContain(token!);
+    expect(JSON.stringify(connected)).not.toContain(token!);
+
+    const status = await loader({
+      request: new Request('https://bolt.example.test/api/github', {
+        headers: { Cookie: session.split(';')[0] },
+      }),
+      context: contextFor({ APP_ENCRYPTION_SECRET: SECRET }),
+    } as unknown as Parameters<typeof loader>[0]);
+    const statusBody = (await status.json()) as Record<string, unknown>;
+
+    expect(status.status).toBe(200);
+    expect(statusBody.connected).toBe(true);
+    expect(statusBody.login).toBe(connected.login);
+    expect(statusBody.tokenKind).toBe('installation');
+    expect(statusBody.storageConfigured).toBe(true);
+    expect(JSON.stringify(statusBody)).not.toContain(token!);
+
+    /*
+     * With `installation` tokens GitHub answers 403 for POST /user/repos, so the
+     * attempt cannot create anything - it exists to prove the route classifies
+     * the refusal instead of failing silently.
+     */
+    const push = await action({
+      request: post(
+        { action: 'push', repoName, files: [{ path: 'README.md', content: '# live route test\n' }] },
+        session.split(';')[0],
+      ),
+      context: contextFor({ APP_ENCRYPTION_SECRET: SECRET }),
+    } as unknown as Parameters<typeof action>[0]);
+    const pushBody = (await push.json()) as Record<string, unknown>;
+
+    expect(connected.repoCreate).toBe('not_allowed');
+    expect(push.status).toBe(403);
+    expect(pushBody.code).toBe('insufficient_permissions');
+    expect(String(pushBody.hint)).toMatch(/Administration|create the repository on GitHub first/i);
+    expect(JSON.stringify(pushBody)).not.toContain(token!);
+  });
+
+  it('classifies an invalid token, clears every credential cookie and echoes nothing', async () => {
+    const invalid = `ghp_${'x'.repeat(36)}`;
+    const outcome = await verifyGitHubToken({ token: invalid }).then(
+      () => 'accepted',
+      () => 'rejected',
+    );
+
+    if (outcome === 'accepted') {
+      /*
+       * This environment authenticates api.github.com requests itself (a
+       * managed proxy injects credentials), so an invalid token cannot be
+       * simulated from inside it. The 401 classification is covered by
+       * app/lib/.server/github.spec.ts against the mock API.
+       */
+      console.warn(
+        '[github-live] environment injects GitHub credentials for api.github.com - invalid-token path not exercisable here',
+      );
+
+      return;
+    }
+
+    const response = await action({
+      request: post({ action: 'connect', token: invalid }),
+      context: contextFor({ APP_ENCRYPTION_SECRET: SECRET }),
+    } as unknown as Parameters<typeof action>[0]);
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(401);
+    expect(body.code).toBe('invalid_token');
+    expect(JSON.stringify(body)).not.toContain(invalid);
+
+    for (const name of ['gh_session', 'githubToken', 'githubUsername', 'git:github.com']) {
+      expect(
+        response.headers.getSetCookie().some((cookie) => cookie.startsWith(`${name}=`) && cookie.includes('Max-Age=0')),
+      ).toBe(true);
+    }
+  });
+
+  it('rejects a cross-origin connect before any GitHub call', async () => {
+    const response = await action({
+      request: new Request('https://bolt.example.test/api/github', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example.test' },
+        body: JSON.stringify({ action: 'connect', token }),
+      }),
+      context: contextFor({ APP_ENCRYPTION_SECRET: SECRET }),
+    } as unknown as Parameters<typeof action>[0]);
+
+    expect(response.status).toBe(403);
+    expect(response.headers.getSetCookie()).toHaveLength(0);
+  });
 });

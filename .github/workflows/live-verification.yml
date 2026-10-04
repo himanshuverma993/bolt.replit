@@ -231,6 +231,159 @@ jobs:
             echo "::warning::expected 501 (no Worker secret) but got HTTP $code; credential-echo check still passed"
           fi
 
+      - name: Both Cloudflare model ids answer through the production deployment
+        if: ${{ steps.target.outputs.is_production == 'true' }}
+        run: |
+          set -uo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          fail=0
+          for model in '@cf/meta/llama-3.1-8b-instruct-fp8' '@cf/meta/llama-3.3-70b-instruct-fp8-fast'; do
+            payload=$(node -e 'process.stdout.write(JSON.stringify({messages:[{role:"user",content:`[Model: ${process.argv[1]}]\n\n[Provider: Cloudflare]\n\nReply with exactly: LIVE_OK`}],files:{}}))' "$model")
+            code=$(curl -sS --max-time 120 -o /tmp/chat-model.out -w '%{http_code}' -X POST "$BASE/api/chat" \
+              -H 'Content-Type: application/json' --data-binary "$payload") || code=000
+            echo "POST /api/chat ($model) -> $code"
+            if [ "$code" != "200" ]; then
+              echo "::error::Cloudflare model $model returned HTTP $code :: $(head -c 300 /tmp/chat-model.out | tr -d '\r' | tr '\n' '|')"
+              fail=1
+              continue
+            fi
+            node -e '
+              const fs = require("fs");
+              const model = process.argv[1];
+              const raw = fs.readFileSync("/tmp/chat-model.out", "utf8");
+              let text = "";
+              for (const line of raw.split("\n")) {
+                const i = line.indexOf(":");
+                if (i < 1 || line.slice(0, i).trim() !== "0") continue;
+                try { const parsed = JSON.parse(line.slice(i + 1)); if (typeof parsed === "string") text += parsed; } catch {}
+              }
+              if (!text.toLowerCase().includes("live_ok")) {
+                console.log(`::error::Cloudflare model ${model} did not answer with LIVE_OK :: ${text.slice(0, 200)}`);
+                process.exit(2);
+              }
+              console.log(`${model}: answered`);
+            ' "$model" || fail=1
+          done
+          if [ "$fail" != "0" ]; then exit 1; fi
+          echo "::notice::both Cloudflare Workers AI model ids answered through the production deployment without an API key"
+
+      - name: GitHub endpoint rejects cross-origin, malformed and unauthenticated requests
+        if: ${{ steps.target.outputs.is_production == 'false' }}
+        run: |
+          set -uo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          # Cross-origin POST must be refused before anything else happens.
+          code=$(curl -sS -o /tmp/gh-csrf.json -w '%{http_code}' -X POST "$BASE/api/github" \
+            -H 'Content-Type: application/json' -H 'Origin: https://evil.example.test' \
+            --data '{"action":"connect","token":"ghp_crossorigin_probe_do_not_store"}') || code=000
+          echo "POST /api/github (cross-origin) -> $code"
+          [ "$code" = "403" ] || { echo "::error::cross-origin GitHub POST was not rejected (HTTP $code)"; exit 1; }
+          # Malformed body must be a clear 400, not a crash.
+          code=$(curl -sS -o /tmp/gh-bad.json -w '%{http_code}' -X POST "$BASE/api/github" \
+            -H 'Content-Type: application/json' --data 'not json') || code=000
+          echo "POST /api/github (malformed body) -> $code"
+          [ "$code" = "400" ] || { echo "::error::malformed GitHub body was not rejected with 400 (HTTP $code)"; exit 1; }
+          # Without a Worker secret the endpoint must fail closed and never echo the token.
+          code=$(curl -sS -o /tmp/gh-connect.json -w '%{http_code}' -X POST "$BASE/api/github" \
+            -H 'Content-Type: application/json' \
+            --data '{"action":"connect","token":"ghp_connect_probe_do_not_store"}') || code=000
+          echo "POST /api/github (connect without Worker secret) -> $code"
+          if grep -q 'ghp_connect_probe_do_not_store' /tmp/gh-connect.json; then
+            echo "::error::/api/github echoed the token it was sent"
+            exit 1
+          fi
+          if [ "$code" = "501" ]; then
+            grep -q 'APP_ENCRYPTION_SECRET' /tmp/gh-connect.json || {
+              echo "::error::501 without a hint naming the missing secret"
+              exit 1
+            }
+            echo "::notice::GitHub token storage fails closed without a Worker secret (HTTP 501) and the token was not echoed"
+          else
+            echo "::warning::expected 501 from /api/github connect (no Worker secret) but got HTTP $code"
+          fi
+          # Reads must still work and must stay free of credential-shaped values.
+          code=$(curl -sS -o /tmp/gh-status.json -w '%{http_code}' "$BASE/api/github") || code=000
+          echo "GET /api/github -> $code"
+          [ "$code" = "200" ] || { echo "::error::GET /api/github returned HTTP $code"; exit 1; }
+          if grep -qiE 'gh[pousr]_[A-Za-z0-9]{10,}|Bearer [A-Za-z0-9._-]{20,}' /tmp/gh-status.json; then
+            echo "::error::/api/github status exposes a credential-shaped value"
+            exit 1
+          fi
+
+      - name: MCP rejects insecure URLs and classifies a real remote server honestly
+        if: ${{ steps.target.outputs.is_production == 'false' }}
+        run: |
+          set -uo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          # Plain http must be refused before any network call.
+          code=$(curl -sS -o /tmp/mcp-http.json -w '%{http_code}' -X POST "$BASE/api/mcp" \
+            -H 'Content-Type: application/json' -H "Origin: $BASE" \
+            --data '{"action":"add","name":"insecure-probe","url":"http://example.com/mcp"}') || code=000
+          echo "POST /api/mcp (plain http url) -> $code"
+          [ "$code" = "400" ] || { echo "::error::an insecure http MCP url was accepted (HTTP $code)"; exit 1; }
+          # A real, publicly reachable MCP server: either its tools are discovered
+          # or the refusal is classified. A silent \"connected with no tools\" is a failure.
+          code=$(curl -sS --max-time 60 -o /tmp/mcp-docs.json -w '%{http_code}' -X POST "$BASE/api/mcp" \
+            -H 'Content-Type: application/json' -H "Origin: $BASE" -c /tmp/mcp.jar \
+            --data '{"action":"add","name":"cloudflare-docs","url":"https://docs.mcp.cloudflare.com/mcp"}') || code=000
+          echo "POST /api/mcp (real remote server) -> $code :: $(head -c 300 /tmp/mcp-docs.json | tr -d '\r' | tr '\n' '|')"
+          [ "$code" = "200" ] || { echo "::error::adding a real remote MCP server returned HTTP $code"; exit 1; }
+          if grep -qiE 'access_token|refresh_token|"token"' /tmp/mcp-docs.json; then
+            echo "::error::the MCP response exposed token material"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const body = JSON.parse(fs.readFileSync("/tmp/mcp-docs.json", "utf8"));
+            const server = body.server || {};
+            const tools = Array.isArray(server.tools) ? server.tools.length : 0;
+            if (server.status === "connected") {
+              if (tools < 1) {
+                console.log("::error::a remote MCP server was reported connected without any discovered tools");
+                process.exit(2);
+              }
+              console.log(`::notice::real remote MCP server connected with ${tools} discovered tool(s): ${server.tools.map((t) => t.name).slice(0, 5).join(", ")}`);
+              process.exit(0);
+            }
+            const classified = ["auth_required", "error"];
+            if (!classified.includes(server.status) || !server.statusCode) {
+              console.log(`::error::remote MCP failure was not classified :: ${JSON.stringify(server).slice(0, 300)}`);
+              process.exit(3);
+            }
+            console.log(`::warning::the remote MCP server refused anonymous access; classified as ${server.statusCode} (status=${server.status})`);
+          '
+
+      - name: MCP OAuth callback rejects a forged redirect without contacting the authorization server
+        if: ${{ steps.target.outputs.is_production == 'false' }}
+        run: |
+          set -uo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          location=$(curl -sS -o /dev/null -w '%{redirect_url}' \
+            "$BASE/api/mcp/oauth/callback?code=attacker-code&state=attacker-state") || location=""
+          echo "GET /api/mcp/oauth/callback (forged, no state cookie) -> $location"
+          case "$location" in
+            *'mcp_oauth=error'*'reason=missing_state_cookie'*) echo "::notice::forged MCP OAuth callback rejected with reason=missing_state_cookie" ;;
+            *) echo "::error::forged MCP OAuth callback was not rejected safely :: $location"; exit 1 ;;
+          esac
+          if printf '%s' "$location" | grep -qiE 'access_token|refresh_token|code=attacker-code'; then
+            echo "::error::the OAuth callback reflected credentials or the attacker code into the redirect"
+            exit 1
+          fi
+          metadata=$(curl -sS -o /tmp/mcp-client-metadata.json -w '%{http_code}' "$BASE/api/mcp/oauth/client-metadata") || metadata=000
+          echo "GET /api/mcp/oauth/client-metadata -> $metadata"
+          [ "$metadata" = "200" ] || { echo "::error::OAuth client metadata is not served (HTTP $metadata)"; exit 1; }
+          node -e '
+            const fs = require("fs");
+            const body = JSON.parse(fs.readFileSync("/tmp/mcp-client-metadata.json", "utf8"));
+            if (body.token_endpoint_auth_method !== "none") { console.log("::error::client metadata advertises a confidential client"); process.exit(2); }
+            if (!Array.isArray(body.redirect_uris) || !body.redirect_uris.some((u) => u.endsWith("/api/mcp/oauth/callback"))) {
+              console.log("::error::client metadata has no callback redirect uri"); process.exit(3);
+            }
+            if (body.client_secret) { console.log("::error::client metadata exposes a client secret"); process.exit(4); }
+            console.log(`::notice::OAuth client metadata served for ${body.client_id}`);
+          '
+
+
       - name: Deployed bundle embeds the deployed commit (staleness check)
         env:
           GH_TOKEN: ${{ github.token }}

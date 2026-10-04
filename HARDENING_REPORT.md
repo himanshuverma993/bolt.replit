@@ -104,7 +104,10 @@ explicitly instead of silently falling back to insecure storage.
 `app/lib/.server/github-route.spec.ts` (11), `app/lib/.server/mcp-route.spec.ts` (11),
 `app/lib/settings/export.spec.ts` (3), `app/lib/security/credential-handling.spec.ts` (5),
 `app/lib/modules/llm/providers/cloudflare.spec.ts` (6, extended), `app/lib/modules/llm/providers/cloudflare.config.spec.ts` (4),
-`app/lib/.server/github.live.spec.ts` (opt-in live suite). Total suite: **135 passing, 3 opt-in skips**.
+`app/lib/.server/github.live.spec.ts` (opt-in live suite), `app/lib/.server/mcp-oauth-mock.fixture.ts`
+(shared mock authorization server), `app/lib/.server/mcp-oauth-callback-route.spec.ts` (route-level OAuth
+callback), `app/lib/modules/llm/providers/cloudflare-tool-loop.spec.ts` (full AI SDK v4 tool loop over the
+Workers AI adapter). Total suite: **142 passing, 6 opt-in skips** (see §11 for the second-pass additions).
 
 The two route-level suites live in `app/lib/.server/` and import `~/routes/api.github` / `~/routes/api.mcp`:
 Remix strips server-only exports from modules inside `app/routes/`, so a spec file placed there broke the
@@ -322,11 +325,11 @@ with `set -o pipefail`):
 | Frozen install | `pnpm install --frozen-lockfile` | 0 | lockfile up to date, 6 s |
 | Typecheck | `pnpm run typecheck` (`tsc`) | 0 | clean |
 | Lint | `pnpm run lint` (eslint, blitz config) | 0 | clean |
-| Tests | `pnpm exec vitest --run` | 0 | **135 passed, 3 skipped, 15 files** (baseline: 44 passed, 6 files) |
+| Tests | `pnpm exec vitest --run` | 0 | **142 passed, 6 skipped, 17 files** (baseline: 44 passed, 6 files) |
 | Production build | `pnpm run build` | 0 | client + SSR bundle (`build/server/index.js` 239.31 kB) |
 | Worker dry-run | `npx wrangler deploy --dry-run` | 0 | 333 asset files, `Total Upload: 3432.69 KiB / gzip: 682.43 KiB`, bindings **`env.AI → AI`** and `env.ASSETS → Assets` |
 
-The 3 skipped tests are the opt-in live GitHub suite: two read-only verifications (no
+The 6 skipped tests are the opt-in live GitHub suite: two read-only verifications (no
 `GITHUB_E2E_TOKEN`) and the disposable-repository write flow (no `GITHUB_E2E_ALLOW_WRITES`). The
 read-only pair was executed separately against the real API — see §6.2 and §10.
 `Tests closed successfully but something prevents Vite server from exiting` is pre-existing noise:
@@ -548,3 +551,75 @@ GITHUB_E2E_TOKEN=<fine-grained PAT with Contents/Administration read+write> \
 Live Cloudflare MCP, live Figma MCP (interactive OAuth + plan), the disposable-repository push
 (fine-grained PAT), `wrangler secret put APP_ENCRYPTION_SECRET` (no Cloudflare credentials in this
 session) and Phase 5 of the roadmap. Each one is listed with its exact manual step in §8.
+
+## 11. Second verification pass (feature-level, current head)
+
+The follow-up request was to stop at nothing short of "every feature works", with GitHub and Cloudflare
+called out by name. Everything that was previously verified only at unit level or not at all was driven one
+level closer to the real thing.
+
+### 11.1 New local evidence
+
+| Suite | What it now proves | Result |
+| --- | --- | --- |
+| `app/lib/modules/llm/providers/cloudflare-tool-loop.spec.ts` (2 tests) | The **real AI SDK v4 `streamText` loop** over the Cloudflare adapter: tool schema sent to Workers AI in the OpenAI shape, the streamed `tool_calls` frame mapped to a v4 tool call, the tool executed, the result returned with its `tool_call_id`, the final text assembled, and `maxSteps` stopping a model that keeps calling tools | 2 passed |
+| `app/lib/.server/mcp-oauth-callback-route.spec.ts` (5 tests) | The **real OAuth redirect route**: a forged callback lands on `/?mcp_oauth=error&reason=…` with the pointer cookie cleared and **zero** requests to the authorization server; a missing cookie, an unknown server and an authorization-server `error` are each surfaced verbatim; a genuine PKCE exchange completes, discovers tools with the token, seals the tokens into an HttpOnly cookie and returns them nowhere in the redirect | 5 passed |
+| `app/lib/.server/github.live.spec.ts` → `live GitHub route (read-only)` (3 tests, opt-in) | The **real route handlers against the real GitHub API**: `connect` returns a sealed `gh_session` cookie and never echoes the token, `GET /api/github` accepts that cookie, a push attempt with an installation token is classified as `insufficient_permissions` with the actionable hint (GitHub rejected `POST /user/repos` with 403 - nothing was created), and a cross-origin POST is refused before any GitHub call | 3 passed live |
+| `app/lib/.server/mcp-oauth-mock.fixture.ts` | The mock MCP resource + authorization server is now shared by the client-level and route-level suites, so both exercise the same protocol implementation | 11 + 5 passed |
+
+Live GitHub route output (real API, read-only):
+
+```
+[github-live] login=himanshuverma993 tokenKind=installation scopes=none repoCreate=not_allowed
+[github-live] repo=himanshuverma993/bolt.replit exists=true push=true admin=true
+POST /user/repos - 403 with id E9A2:3800CF:119DFEA:13524E8:6AC25AE8 in 164ms
+[github] insufficient_permissions: GitHub refused the request (HTTP 403): Resource not accessible by integration
+```
+
+One environment caveat, verified rather than assumed: a deliberately invalid token still authenticates inside
+this sandbox because the network path injects GitHub credentials for `api.github.com`. The invalid-token test
+therefore detects that condition and says so instead of passing vacuously
+(`[github-live] environment injects GitHub credentials for api.github.com - invalid-token path not exercisable here`);
+the 401 → `invalid_token` mapping stays covered by `github.spec.ts` against the mock API.
+
+### 11.2 New live CI steps (`.github/workflows/live-verification.yml`, now 13 steps)
+
+| Step | Runs on | Assertion |
+| --- | --- | --- |
+| 9. Both Cloudflare model ids answer through the production deployment | production | Both `@cf/meta/llama-3.1-8b-instruct-fp8` and `@cf/meta/llama-3.3-70b-instruct-fp8-fast` answer `LIVE_OK` through `/api/chat` with no API key; a failure names the model, the status and the body |
+| 10. GitHub endpoint rejects cross-origin, malformed and unauthenticated requests | branch preview | Cross-origin POST → 403, malformed body → 400, `connect` without a Worker secret → 501 naming `APP_ENCRYPTION_SECRET`, the token is never echoed, and `GET /api/github` stays free of credential-shaped values |
+| 11. MCP rejects insecure URLs and classifies a real remote server honestly | branch preview | `http://` is refused with 400 before any network call; adding a **real remote MCP server** (`https://docs.mcp.cloudflare.com/mcp`) either discovers tools (notices their names) or reports a **classified** failure - `connected` with zero tools, an unclassified error, or any token material in the response fails the step |
+| 12. MCP OAuth callback rejects a forged redirect without contacting the authorization server | branch preview | The forged callback must land on `reason=missing_state_cookie`, must not reflect the attacker's code or any token, and `/api/mcp/oauth/client-metadata` must advertise `token_endpoint_auth_method: none` with the callback redirect URI and no client secret |
+
+All step bodies were validated structurally (`bash -n` on every `run:` block) and **behaviourally** by running
+them against a stubbed `curl` with canned Worker responses: the happy path of each new step exits 0 with its
+notice, and each failure variant (cross-origin accepted, model failure, `connected` with no tools,
+unclassified MCP error, token material in the body, reflected attacker code, confidential client metadata,
+missing callback URI) exits non-zero. The workflow YAML parses with `js-yaml` (13 steps).
+
+### 11.3 How each named feature is verified, level by level
+
+* **GitHub connection** - cookie/AES unit tests (`secrets.spec.ts`, 11) → full push protocol against a mock
+  GitHub API (`github.spec.ts`, 25) → route wiring and limits (`github-route.spec.ts`, 11) → **real GitHub API
+  through the real routes** (§11.1, 3 live tests) → live deployment probes (§11.2 step 10). The only remaining
+  gap is the disposable-repository write flow, which needs a fine-grained PAT (§10.1).
+* **Cloudflare connection** - provider contract, streaming, tool calls and `tool_call_id` (`cloudflare.spec.ts`,
+  6 + `cloudflare.config.spec.ts`, 4) → **full v4 tool loop** (`cloudflare-tool-loop.spec.ts`, 2) → **real
+  inference on the production deployment** (`LIVE_OK`, 8B; §11.2 step 9 adds the 70B fast model). The live tool
+  loop with real MCP tools still needs a deployment that has both `env.AI` and a merged branch (§10.4).
+* **MCP (authless, bearer, OAuth)** - 14 + 11 + 11 tests, plus the route-level OAuth callback suite (§11.1) and
+  the live steps 11 and 12.
+* **No-MCP chat** - `toolChoice: 'none'` path asserted in `cloudflare.spec.ts` and the live production chat probe
+  (no tools configured).
+
+### 11.4 Blocked or unverified in this environment (unchanged, now restated)
+
+* The disposable-repository write flow (fine-grained PAT with Contents + Administration) - §10.1 has the
+  closing command.
+* Live Cloudflare / Figma MCP authorization (interactive browser OAuth, Figma MCP-capable plan).
+* A browser/dev-server run of the UI: `remix vite:dev` cannot start here because `wrangler.toml` sets
+  `[ai] remote = true`, so the Remix dev proxy needs a `CLOUDFLARE_API_TOKEN` that this sandbox does not have.
+  There is no browser in the sandbox either, so UI interaction (Settings → Connection tabs) remains verified by
+  code review, unit tests and the live HTTP probes rather than by clicking.
+* Live Workers AI **tool looping** (needs a deployment that carries both `env.AI` and this branch).
+* `wrangler secret put APP_ENCRYPTION_SECRET`, and the 53 pre-existing dependency advisories.
