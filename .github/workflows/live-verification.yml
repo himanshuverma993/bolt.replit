@@ -102,28 +102,48 @@ jobs:
           JSON
           code=$(curl -sS --max-time 120 -o /tmp/chat.out -w '%{http_code}' -X POST "$BASE/api/chat" \
             -H 'Content-Type: application/json' --data-binary @/tmp/chat.json) || code=000
-          body=$(head -c 700 /tmp/chat.out 2>/dev/null | tr -d '\r' | tr '\n' '|' | sed 's/%/%25/g')
           echo "POST /api/chat -> $code"
-          echo "$body"
-          echo "::notice::POST /api/chat -> $code :: $body"
-          fail=0
+          head -c 200 /tmp/chat.out; echo
           if [ "$code" = "404" ] || [ "$code" = "405" ]; then
-            # A build that predates the merge does not serve the route at all.
-            echo "::warning::/api/chat is not served by the deployed build yet (HTTP $code); the probe runs against the live default branch"
+            echo "::warning::/api/chat is not served by the deployed build (HTTP $code)"
             exit 0
           fi
+          fail=0
           [ "$code" = "200" ] || { echo 'FAIL: /api/chat did not return 200'; fail=1; }
           grep -qi 'binding is unavailable' /tmp/chat.out && { echo 'FAIL: Workers AI binding is not deployed on this Worker'; fail=1; }
           grep -qi 'No API key\|API key' /tmp/chat.out && { echo 'FAIL: Cloudflare provider asked for an API key on the native env.AI path'; fail=1; }
-          # AI SDK v4 data-stream protocol: text deltas are frames of the form 0:"...".
-          chunks=$(grep -c '0:"' /tmp/chat.out || true)
-          echo "text delta frames: $chunks"
-          [ "$chunks" -ge 1 ] || { echo 'FAIL: no streamed text frames (0:"...") in the chat response'; fail=1; }
-          grep -qi 'LIVE_OK' /tmp/chat.out || { echo 'FAIL: model output does not contain the requested token LIVE_OK'; fail=1; }
+          proceed=0
+          if [ "$fail" = "0" ]; then
+            # AI SDK v4 data-stream protocol: text arrives as frames of the form 0:"...".
+            node -e '
+              const fs = require("fs");
+              const raw = fs.readFileSync("/tmp/chat.out", "utf8");
+              let text = "";
+              let frames = 0;
+              for (const line of raw.split("\n")) {
+                const i = line.indexOf(":");
+                if (i < 1 || line.slice(0, i).trim() !== "0") continue;
+                try {
+                  const parsed = JSON.parse(line.slice(i + 1));
+                  if (typeof parsed === "string") { text += parsed; frames += 1; }
+                } catch {}
+              }
+              console.log(`text frames=${frames} chars=${text.length}`);
+              fs.writeFileSync("/tmp/chat.text", text);
+              if (frames < 1) { console.log("::error::no text frames (0:\"...\") in the chat data stream"); process.exit(2); }
+              if (!text.toLowerCase().includes("live_ok")) {
+                console.log(`::error::model output does not contain LIVE_OK :: ${text.slice(0, 300).replace(/\n/g, " ")}`);
+                process.exit(3);
+              }
+              console.log("model output contains LIVE_OK");
+            ' || { echo 'FAIL: chat data stream did not contain the requested model output'; fail=1; }
+          fi
+          tail=$(head -c 400 /tmp/chat.out | tr -d '\r' | tr '\n' '|' | sed 's/%/%25/g')
           if [ "$fail" = "1" ]; then
-            echo "::error::Workers AI chat probe failed (HTTP $code) :: $body"
+            echo "::error::Workers AI chat probe failed (HTTP $code) :: $tail"
             exit 1
           fi
+          echo "::notice::Workers AI chat probe passed (HTTP $code) :: $tail"
 
       - name: Confirm no credential is echoed by the chat error path
         run: |
