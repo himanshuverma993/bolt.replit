@@ -297,6 +297,35 @@ export function classifyMcpError(error: unknown, phase: 'connect' | 'list' | 'ca
   return new McpError('unknown', `MCP connection failed: ${rawMessage}`);
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+const PRIVATE_IPV4 =
+  /^(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3})$/;
+
+/*
+ * Plain http is a local-development convenience (self-hosted servers on the same
+ * machine or LAN). A public host over http would send a bearer token in
+ * cleartext, so those must use https.
+ */
+function isLocalOrPrivateHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+
+  if (LOOPBACK_HOSTS.has(host) || host === '::1') {
+    return true;
+  }
+
+  if (host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+    return true;
+  }
+
+  if (PRIVATE_IPV4.test(host)) {
+    return true;
+  }
+
+  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10) ranges.
+  return /^f[cd][0-9a-f]{2}:/.test(host) || /^fe[89ab][0-9a-f]:/.test(host);
+}
+
 export function validateServerUrl(value: string): string {
   let url: URL;
 
@@ -310,6 +339,13 @@ export function validateServerUrl(value: string): string {
     throw new McpError('invalid_request', 'MCP server URL must use http:// or https://');
   }
 
+  if (url.protocol === 'http:' && !isLocalOrPrivateHost(url.hostname)) {
+    throw new McpError(
+      'invalid_request',
+      'MCP server URLs must use https:// for remote hosts; http:// is only accepted for localhost or private-network addresses',
+    );
+  }
+
   if (url.username || url.password) {
     throw new McpError('invalid_request', 'MCP server URL must not contain credentials; use the bearer token field');
   }
@@ -320,8 +356,6 @@ export function validateServerUrl(value: string): string {
 
   return url.toString();
 }
-
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
 
 /**
  * Validates the authorization URL a remote server (or its `WWW-Authenticate`

@@ -588,8 +588,16 @@ the 401 → `invalid_token` mapping stays covered by `github.spec.ts` against th
 | --- | --- | --- |
 | 9. Both Cloudflare model ids answer through the production deployment | production | Both `@cf/meta/llama-3.1-8b-instruct-fp8` and `@cf/meta/llama-3.3-70b-instruct-fp8-fast` answer `LIVE_OK` through `/api/chat` with no API key; a failure names the model, the status and the body |
 | 10. GitHub endpoint rejects cross-origin, malformed and unauthenticated requests | branch preview | Cross-origin POST → 403, malformed body → 400, `connect` without a Worker secret → 501 naming `APP_ENCRYPTION_SECRET`, the token is never echoed, and `GET /api/github` stays free of credential-shaped values |
-| 11. MCP rejects insecure URLs and classifies a real remote server honestly | branch preview | `http://` is refused with 400 before any network call; adding a **real remote MCP server** (`https://docs.mcp.cloudflare.com/mcp`) either discovers tools (notices their names) or reports a **classified** failure - `connected` with zero tools, an unclassified error, or any token material in the response fails the step |
+| 11. MCP rejects insecure URLs and classifies a real remote server honestly | branch preview | A **public** `http://` URL is refused with 400 before any network call (see the finding below); adding a **real remote MCP server** (`https://docs.mcp.cloudflare.com/mcp`) either discovers tools (notices their names) or reports a **classified** failure - `connected` with zero tools, an unclassified error, or any token material in the response fails the step |
 | 12. MCP OAuth callback rejects a forged redirect without contacting the authorization server | branch preview | The forged callback must land on `reason=missing_state_cookie`, must not reflect the attacker's code or any token, and `/api/mcp/oauth/client-metadata` must advertise `token_endpoint_auth_method: none` with the callback redirect URI and no client secret |
+
+The new step found a real gap on its first live run: `POST /api/mcp` accepted
+`http://example.com/mcp` (HTTP 200) and only rejected `ftp://`. `validateServerUrl` had allowed plain http
+for every host since the upstream code, so a bearer token could be sent in cleartext to a remote server. The
+rule is now aligned with the authorization-URL rule: **https is required for remote hosts, http is accepted
+only for localhost and private-network addresses** (loopback, `.local`/`.internal`, RFC 1918, IPv6 ULA/link
+local), with unit tests for each case. The three preview-only steps now also run *after* the staleness step,
+so they probe a preview that has had time to rebuild.
 
 All step bodies were validated structurally (`bash -n` on every `run:` block) and **behaviourally** by running
 them against a stubbed `curl` with canned Worker responses: the happy path of each new step exits 0 with its

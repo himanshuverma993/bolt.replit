@@ -267,6 +267,62 @@ jobs:
           if [ "$fail" != "0" ]; then exit 1; fi
           echo "::notice::both Cloudflare Workers AI model ids answered through the production deployment without an API key"
 
+      - name: Deployed bundle embeds the deployed commit (staleness check)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PUSHED_SHA: ${{ github.sha }}
+          IS_PRODUCTION: ${{ steps.target.outputs.is_production }}
+        run: |
+          set -uo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          if [ "$IS_PRODUCTION" = "true" ]; then
+            expected="main tip"
+            main_short=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/commits/main" \
+              | node -e 'let d="";process.stdin.on("data",(c)=>d+=c).on("end",()=>{try{console.log(JSON.parse(d).sha.slice(0,7))}catch{console.log("unknown")}})') || main_short=unknown
+          else
+            # No checkout step runs here; the pushed revision is on the event payload.
+            expected="pushed commit"
+            main_short=$(echo "$PUSHED_SHA" | cut -c1-7)
+          fi
+          echo "expected ($expected): $main_short"
+          markers=none
+          entry=none
+          attempt=1
+          max_attempts=8
+          while [ "$attempt" -le "$max_attempts" ]; do
+            # Re-read the HTML every attempt: a deployment replaces the hashed asset
+            # name, so a cached name from an earlier step can legitimately 404.
+            homepage=$(curl -sS --max-time 30 "$BASE/" 2>/dev/null || true)
+            entry=$(printf '%s' "$homepage" | grep -o '/assets/index-[^"]*\.js' | head -1 || true)
+            if [ -z "$entry" ]; then
+              echo "attempt $attempt/$max_attempts: no entry asset in the served HTML"
+            else
+              code=$(curl -sS --max-time 60 -o /tmp/entry.js -w '%{http_code}' "$BASE$entry" || echo 000)
+              markers=$(node -e '
+                const fs = require("fs");
+                const s = fs.readFileSync("/tmp/entry.js", "utf8");
+                const set = new Set();
+                for (const m of s.match(/"[0-9a-f]{7}"/g) || []) set.add(m.replace(/"/g, ""));
+                console.log([...set].slice(0, 8).join(",") || "none");
+              ' 2>/dev/null || echo none)
+              echo "attempt $attempt/$max_attempts: $entry -> HTTP $code, markers=$markers"
+              if [ "$code" = "200" ] && echo ",$markers," | grep -q ",$main_short,"; then
+                echo "::notice::live bundle embeds $main_short, the current $expected - the deployment is built from that revision"
+                exit 0
+              fi
+            fi
+            # A branch preview build starts with the push: give it a few minutes.
+            # Production lag is a real signal, so do not wait for it.
+            if [ "$expected" = "main tip" ]; then
+              break
+            fi
+            attempt=$((attempt + 1))
+            sleep 30
+          done
+          echo "::warning::live bundle does not embed the current $expected ($main_short); entry=$entry markers=$markers (a build may still be in flight)"
+
       - name: GitHub endpoint rejects cross-origin, malformed and unauthenticated requests
         if: ${{ steps.target.outputs.is_production == 'false' }}
         run: |
@@ -383,59 +439,3 @@ jobs:
             console.log(`::notice::OAuth client metadata served for ${body.client_id}`);
           '
 
-
-      - name: Deployed bundle embeds the deployed commit (staleness check)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PUSHED_SHA: ${{ github.sha }}
-          IS_PRODUCTION: ${{ steps.target.outputs.is_production }}
-        run: |
-          set -uo pipefail
-          BASE="${{ steps.target.outputs.base }}"
-          if [ "$IS_PRODUCTION" = "true" ]; then
-            expected="main tip"
-            main_short=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/$REPO/commits/main" \
-              | node -e 'let d="";process.stdin.on("data",(c)=>d+=c).on("end",()=>{try{console.log(JSON.parse(d).sha.slice(0,7))}catch{console.log("unknown")}})') || main_short=unknown
-          else
-            # No checkout step runs here; the pushed revision is on the event payload.
-            expected="pushed commit"
-            main_short=$(echo "$PUSHED_SHA" | cut -c1-7)
-          fi
-          echo "expected ($expected): $main_short"
-          markers=none
-          entry=none
-          attempt=1
-          max_attempts=8
-          while [ "$attempt" -le "$max_attempts" ]; do
-            # Re-read the HTML every attempt: a deployment replaces the hashed asset
-            # name, so a cached name from an earlier step can legitimately 404.
-            homepage=$(curl -sS --max-time 30 "$BASE/" 2>/dev/null || true)
-            entry=$(printf '%s' "$homepage" | grep -o '/assets/index-[^"]*\.js' | head -1 || true)
-            if [ -z "$entry" ]; then
-              echo "attempt $attempt/$max_attempts: no entry asset in the served HTML"
-            else
-              code=$(curl -sS --max-time 60 -o /tmp/entry.js -w '%{http_code}' "$BASE$entry" || echo 000)
-              markers=$(node -e '
-                const fs = require("fs");
-                const s = fs.readFileSync("/tmp/entry.js", "utf8");
-                const set = new Set();
-                for (const m of s.match(/"[0-9a-f]{7}"/g) || []) set.add(m.replace(/"/g, ""));
-                console.log([...set].slice(0, 8).join(",") || "none");
-              ' 2>/dev/null || echo none)
-              echo "attempt $attempt/$max_attempts: $entry -> HTTP $code, markers=$markers"
-              if [ "$code" = "200" ] && echo ",$markers," | grep -q ",$main_short,"; then
-                echo "::notice::live bundle embeds $main_short, the current $expected - the deployment is built from that revision"
-                exit 0
-              fi
-            fi
-            # A branch preview build starts with the push: give it a few minutes.
-            # Production lag is a real signal, so do not wait for it.
-            if [ "$expected" = "main tip" ]; then
-              break
-            fi
-            attempt=$((attempt + 1))
-            sleep 30
-          done
-          echo "::warning::live bundle does not embed the current $expected ($main_short); entry=$entry markers=$markers (a build may still be in flight)"

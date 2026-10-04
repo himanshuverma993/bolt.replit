@@ -442,6 +442,18 @@ describe('MCP Streamable HTTP client', () => {
     expect(() => validateServerUrl('https://user:pass@example.com/mcp')).toThrow(/credentials/);
     expect(() => validateServerUrl('https://example.com/mcp?token=abc')).toThrow(/query string/);
     expect(validateServerUrl('https://mcp.example.com/mcp')).toBe('https://mcp.example.com/mcp');
+
+    /*
+     * http is a local/private-network convenience only; a public host over http
+     * would carry the bearer token in cleartext.
+     */
+    expect(validateServerUrl('http://127.0.0.1:8931/mcp')).toBe('http://127.0.0.1:8931/mcp');
+    expect(validateServerUrl('http://localhost:8931/mcp')).toBe('http://localhost:8931/mcp');
+    expect(validateServerUrl('http://192.168.1.20:8931/mcp')).toBe('http://192.168.1.20:8931/mcp');
+    expect(validateServerUrl('http://10.0.0.5:8931/mcp')).toBe('http://10.0.0.5:8931/mcp');
+    expect(validateServerUrl('http://[fd00::1]:8931/mcp')).toBe('http://[fd00::1]:8931/mcp');
+    expect(() => validateServerUrl('http://example.com/mcp')).toThrow(/https/);
+    expect(() => validateServerUrl('http://8.8.8.8/mcp')).toThrow(/https/);
   });
 
   it('only allows https (or loopback http) authorization URLs to reach the browser', async () => {
