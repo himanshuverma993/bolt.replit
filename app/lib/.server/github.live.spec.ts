@@ -208,6 +208,52 @@ describeLive('live GitHub route (read-only)', () => {
     expect(JSON.stringify(pushBody)).not.toContain(token!);
   });
 
+  it('re-verifies permissions and clears the sealed session on disconnect', async () => {
+    const connect = await action({
+      request: post({ action: 'connect', token: token!, repo: probeRepo }),
+      context: contextFor({ APP_ENCRYPTION_SECRET: SECRET }),
+    } as unknown as Parameters<typeof action>[0]);
+    const session = connect.headers.getSetCookie().find((cookie) => cookie.startsWith('gh_session='))!;
+    const cookie = session.split(';')[0];
+
+    const verify = await action({
+      request: post({ action: 'verify', repo: probeRepo }, cookie),
+      context: contextFor({ APP_ENCRYPTION_SECRET: SECRET }),
+    } as unknown as Parameters<typeof action>[0]);
+    const verified = (await verify.json()) as Record<string, unknown>;
+    const resealed = verify.headers.getSetCookie().find((value) => value.startsWith('gh_session='));
+
+    expect(verify.status).toBe(200);
+    expect(verified.connected).toBe(true);
+    expect(verified.verificationFresh).toBe(true);
+    expect(typeof verified.verifiedAt).toBe('string');
+    expect(JSON.stringify(verified)).not.toContain(token!);
+    expect(resealed).toBeDefined();
+    expect(resealed).toContain('HttpOnly');
+    expect(resealed).not.toContain(token!);
+
+    // Re-sealing refreshes the timestamp, so the sealed value must differ.
+    expect(resealed).not.toBe(session);
+    console.log(`[github-live] verify refreshed the sealed session for ${String(verified.login)}`);
+
+    const disconnect = await action({
+      request: post({ action: 'disconnect' }, cookie),
+      context: contextFor({ APP_ENCRYPTION_SECRET: SECRET }),
+    } as unknown as Parameters<typeof action>[0]);
+    const disconnected = (await disconnect.json()) as Record<string, unknown>;
+    const cleared = disconnect.headers.getSetCookie();
+
+    expect(disconnect.status).toBe(200);
+    expect(disconnected.connected).toBe(false);
+    expect(JSON.stringify(disconnected)).not.toContain(token!);
+
+    for (const name of ['gh_session', 'githubToken', 'githubUsername', 'git:github.com']) {
+      expect(cleared.some((value) => value.startsWith(`${name}=`) && /Max-Age=0/i.test(value))).toBe(true);
+    }
+
+    console.log('[github-live] disconnect cleared the sealed session and every legacy cookie');
+  });
+
   it('classifies an invalid token, clears every credential cookie and echoes nothing', async () => {
     const invalid = `ghp_${'x'.repeat(36)}`;
     const outcome = await verifyGitHubToken({ token: invalid }).then(

@@ -48,6 +48,8 @@ const SECURE_BEARER_TOKEN = 'smoke-bearer-token-value';
  */
 const IDENTITY_HEADERS = { 'Accept-Encoding': 'identity' };
 
+const mcpToolCalls = [];
+
 function startMockMcpServer(port) {
   const server = createServer(async (request, response) => {
     let body = '';
@@ -107,8 +109,23 @@ function startMockMcpServer(port) {
               // validator - the exact path that used to require Ajv codegen.
               outputSchema: { type: 'object', properties: { title: { type: 'string' } } },
             },
+            {
+              name: 'delete_page',
+              description: 'Delete a page permanently',
+              inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+            },
           ],
         },
+      });
+    }
+
+    if (message.method === 'tools/call') {
+      mcpToolCalls.push(String(message.params?.name ?? 'unnamed'));
+
+      return reply({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { content: [{ type: 'text', text: `page-content-for:${message.params?.arguments?.id ?? 'none'}` }] },
       });
     }
 
@@ -118,7 +135,65 @@ function startMockMcpServer(port) {
   return new Promise((resolveServer) => server.listen(port, '127.0.0.1', () => resolveServer(server)));
 }
 
-function startWorker(port, mcpPort) {
+function startHarnessWorker(port, inspectorPort) {
+  const configDir = mkdtempSync(join(tmpdir(), 'bolt-harness-'));
+  const configPath = join(configDir, 'wrangler.harness.toml');
+  const config = [
+    'name = "bolt-mcp-tool-call-harness"',
+    `dev = { inspector_port = ${inspectorPort} }`,
+    `main = ${JSON.stringify(join(repoRoot, 'scripts/ci/mcp-tool-call-harness.ts'))}`,
+    'compatibility_date = "2024-11-27"',
+    'compatibility_flags = ["nodejs_compat"]',
+    '',
+    '[vars]',
+    'APP_ENCRYPTION_SECRET = "smoke-test-secret-32-characters!!"',
+  ].join('\n');
+  const tsconfig = {
+    compilerOptions: {
+      target: 'ES2022',
+      module: 'ESNext',
+      moduleResolution: 'Bundler',
+      baseUrl: '.',
+      // The harness imports the app module through the app's alias, exactly like
+      // the Remix build does.
+      paths: { '~/*': [join(repoRoot, 'app/*')] },
+    },
+    include: [join(repoRoot, 'scripts/ci/mcp-tool-call-harness.ts')],
+  };
+
+  writeFileSync(configPath, config);
+  writeFileSync(join(configDir, 'tsconfig.json'), JSON.stringify(tsconfig, null, 2));
+  log(`spawning the MCP tool-call harness: pnpm exec wrangler dev -c <tmp>/wrangler.harness.toml --port ${port}`);
+
+  const child = spawn(
+    'pnpm',
+    [
+      'exec',
+      'wrangler',
+      'dev',
+      '-c',
+      configPath,
+      '--port',
+      String(port),
+      '--inspector-port',
+      String(inspectorPort),
+      '--ip',
+      '127.0.0.1',
+    ],
+    // cwd stays at the repo so `pnpm exec` uses the project's own wrangler; the
+    // config and its tsconfig live in the temp directory.
+    { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  const output = [];
+
+  child.stdout.on('data', (chunk) => output.push(String(chunk)));
+  child.stderr.on('data', (chunk) => output.push(String(chunk)));
+  child.on('error', (error) => output.push(`spawn error: ${error.message}\n`));
+
+  return { child, output };
+}
+
+function startWorker(port, mcpPort, inspectorPort) {
   const configDir = mkdtempSync(join(tmpdir(), 'bolt-smoke-'));
   const configPath = join(configDir, 'wrangler.smoke.toml');
   const config = [
@@ -144,7 +219,19 @@ function startWorker(port, mcpPort) {
 
   const child = spawn(
     'pnpm',
-    ['exec', 'wrangler', 'dev', '-c', configPath, '--port', String(port), '--ip', '127.0.0.1'],
+    [
+      'exec',
+      'wrangler',
+      'dev',
+      '-c',
+      configPath,
+      '--port',
+      String(port),
+      '--inspector-port',
+      String(inspectorPort),
+      '--ip',
+      '127.0.0.1',
+    ],
     { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] },
   );
   const output = [];
@@ -185,10 +272,16 @@ async function waitForWorker(base, child, output) {
 async function main() {
   const workerPort = await pickPort();
   const mcpPort = await pickPort();
+  const harnessPort = await pickPort();
+  const inspectorPort = await pickPort();
+  const harnessInspectorPort = await pickPort();
   const mcpServer = await startMockMcpServer(mcpPort);
-  const { child, output, configDir } = startWorker(workerPort, mcpPort);
+  const { child, output, configDir } = startWorker(workerPort, mcpPort, inspectorPort);
+  const harness = startHarnessWorker(harnessPort, harnessInspectorPort);
   const base = `http://127.0.0.1:${workerPort}`;
+  const harnessBase = `http://127.0.0.1:${harnessPort}`;
   const failures = [];
+  let cookieHeader = '';
 
   const fail = (message) => {
     failures.push(message);
@@ -213,6 +306,8 @@ async function main() {
     log(`POST /api/mcp (add) -> ${response.status} status=${server.status} code=${server.statusCode ?? 'none'}`);
     log(`tools: ${tools.join(', ') || 'none'}`);
 
+    const authlessCookies = response.headers.getSetCookie().map((value) => value.split(';')[0]);
+
     if (response.status !== 200) {
       fail(`expected HTTP 200 from /api/mcp, received ${response.status}: ${JSON.stringify(body).slice(0, 300)}`);
     } else if (server.status !== 'connected') {
@@ -232,7 +327,12 @@ async function main() {
      */
     const secureResponse = await fetch(`${base}/api/mcp`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Origin: base, ...IDENTITY_HEADERS },
+      headers: {
+        'Content-Type': 'application/json',
+        Origin: base,
+        ...(authlessCookies.length ? { Cookie: authlessCookies.join('; ') } : {}),
+        ...IDENTITY_HEADERS,
+      },
       body: JSON.stringify({
         action: 'add',
         name: 'smoke-secure',
@@ -246,6 +346,7 @@ async function main() {
     const secureTools = Array.isArray(secureServer.tools) ? secureServer.tools.map((tool) => tool.name) : [];
     const cookies = secureResponse.headers.getSetCookie();
     const credentialCookie = cookies.find((cookie) => cookie.startsWith('mcpSecrets='));
+    cookieHeader = cookies.map((value) => value.split(';')[0]).join('; ');
 
     log(
       `POST /api/mcp (bearer) -> ${secureResponse.status} status=${secureServer.status} code=${secureServer.statusCode ?? 'none'}`,
@@ -338,10 +439,99 @@ async function main() {
     } else {
       log('missing Workers AI binding produces an explicit, actionable error inside workerd');
     }
+    /*
+     * 5. A real MCP tools/call, executed in the Worker: the harness calls the
+     * tool object `getMcpTools()` built (the same object the chat route hands to
+     * the AI SDK), with the sealed cookie produced above - so cookie decryption
+     * across Workers and the tools/call path are both exercised, which the chat
+     * route cannot reach without an [ai] binding.
+     */
+    if (cookieHeader.length === 0) {
+      fail('no sealed MCP credential cookie was captured, so the tool-call checks cannot run');
+    } else {
+      await waitForWorker(harnessBase, harness.child, harness.output);
+
+      const harnessResponse = await fetch(harnessBase, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-mcp-cookie': cookieHeader, ...IDENTITY_HEADERS },
+        body: JSON.stringify({}),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const harnessBody = await harnessResponse.json();
+
+      log(`harness tool list -> ${harnessResponse.status} ${JSON.stringify(harnessBody.names ?? harnessBody).slice(0, 200)}`);
+
+      const nameFor = (serverName, toolName) => `mcp_${serverName.replace(/[^A-Za-z0-9_-]/g, '_')}_${toolName}`;
+      const readTool = nameFor('smoke-mock', 'get_page');
+      const destructiveTool = nameFor('smoke-mock', 'delete_page');
+
+      for (const expected of [readTool, destructiveTool, nameFor('smoke-secure', 'get_secure_page')]) {
+        if (!Array.isArray(harnessBody.names) || !harnessBody.names.includes(expected)) {
+          fail(`the harness did not discover ${expected} from the sealed cookie: ${JSON.stringify(harnessBody.names)}`);
+        }
+      }
+
+      const callResponse = await fetch(harnessBase, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-mcp-cookie': cookieHeader,
+          'x-mcp-tool': readTool,
+          ...IDENTITY_HEADERS,
+        },
+        body: JSON.stringify({ id: 'smoke-1' }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const callBody = await callResponse.json();
+
+      log(
+        `harness tools/call ${readTool} -> ${callResponse.status} ${JSON.stringify(callBody.result ?? callBody).slice(0, 160)}`,
+      );
+
+      if (callResponse.status !== 200) {
+        fail(`the harness tool call failed with HTTP ${callResponse.status}: ${JSON.stringify(callBody).slice(0, 200)}`);
+      } else if (!String(callBody.result ?? '').includes('page-content-for:smoke-1')) {
+        fail(`the MCP tools/call did not return the server's payload: ${JSON.stringify(callBody).slice(0, 200)}`);
+      } else if (!mcpToolCalls.includes('get_page')) {
+        fail('the mock MCP server never received the tools/call request');
+      } else {
+        log('MCP tools/call works inside workerd and returned the server payload');
+      }
+
+      /*
+       * 6. The destructive-tool gate: a tool classified as destructive must not be
+       * dispatched at all until the user opts in per server.
+       */
+      const before = mcpToolCalls.length;
+      const deniedResponse = await fetch(harnessBase, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-mcp-cookie': cookieHeader,
+          'x-mcp-tool': destructiveTool,
+          ...IDENTITY_HEADERS,
+        },
+        body: JSON.stringify({ id: 'smoke-1' }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const deniedBody = await deniedResponse.json();
+      const deniedText = String(deniedBody.result ?? '');
+
+      log(`harness tools/call ${destructiveTool} -> ${deniedResponse.status} ${deniedText.slice(0, 160)}`);
+
+      if (!/was NOT executed/i.test(deniedText)) {
+        fail(`a destructive tool was not gated: ${deniedText.slice(0, 200) || JSON.stringify(deniedBody).slice(0, 200)}`);
+      } else if (mcpToolCalls.length !== before) {
+        fail(`a destructive tool reached the MCP server despite being unapproved: ${mcpToolCalls.slice(before).join(', ')}`);
+      } else {
+        log('destructive tools are refused before dispatch inside workerd');
+      }
+    }
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   } finally {
     child.kill('SIGTERM');
+    harness.child.kill('SIGTERM');
     mcpServer.close();
     setTimeout(() => process.exit(failures.length ? 1 : 0), 250).unref();
   }

@@ -747,7 +747,7 @@ dependencies were added for this: `@testing-library/react` 16.3.3 + `@testing-li
 INSTALL_EXIT=0   (install 5s, frozen lockfile)
 TYPECHECK_EXIT=0 (tsc 11s)
 LINT_EXIT=0      (eslint 2s)
-TESTS_EXIT=0     (vitest: 180 passed | 6 skipped, 23 files passed + 1 skipped)
+TESTS_EXIT=0     (vitest: 180 passed | 7 opt-in skips, 23 files passed + 1 skipped)
 BUILD_EXIT=0     (remix vite:build 29s)
 DRYRUN_EXIT=0    (wrangler deploy --dry-run 31s; bindings env.AI, env.ASSETS)
 ```
@@ -774,13 +774,18 @@ four, each of which is only reachable in the real runtime:
 
 | Check | What it proves | Output |
 | --- | --- | --- |
-| Authless MCP connect | the Ajv-codegen regression guard (tool with an `outputSchema`) | `status=connected tools=get_page` |
+| Authless MCP connect | the Ajv-codegen regression guard (tool with an `outputSchema`) | `status=connected tools=get_page,delete_page` |
 | Bearer MCP server + cookie read-back | the token really reached the server (the mock answers 401 otherwise), the response did not echo it, an `HttpOnly` `mcpSecrets` cookie holds a **sealed** value, and `GET /api/mcp` with that cookie reads the server back - i.e. the AES-GCM seal/open round trip works in workerd, not just on Node | `POST /api/mcp (bearer) -> 200 status=connected`, `bearer tools: get_secure_page`, `credential seal/open inside workerd works` |
 | GitHub session handling | an unreadable `gh_session` cookie is reported as `connected=false, reason=unreadable` instead of crashing | `GET /api/github (unreadable session) -> 200 reason=unreadable` |
 | Cloudflare without `env.AI` | the user-facing error is explicit and actionable and does not ask for an API key | `POST /api/chat (Cloudflare, no [ai] binding) -> 200 bytes=140`, `missing Workers AI binding produces an explicit, actionable error inside workerd` |
+| **MCP `tools/call` actually executes** | `scripts/ci/mcp-tool-call-harness.ts` is a second Worker that calls the real `getMcpTools()` with the sealed cookie produced by the first - so the cookie is decrypted by a *different* Worker and the tool object the chat route hands to the AI SDK really runs. The mock server's payload comes back | `harness tools/call mcp_smoke-mock_get_page -> 200 ... page-content-for:smoke-1`, `MCP tools/call works inside workerd and returned the server payload` |
+| **Destructive tools are gated before dispatch** | the same harness calls a `delete_page` tool (classified `destructive`, server not opted in): the tool answers with the refusal text **and the mock MCP server never receives a `tools/call`** (the parent process counts them) | `harness tools/call mcp_smoke-mock_delete_page -> 200 ... was NOT executed`, `destructive tools are refused before dispatch inside workerd` |
 
-Teeth check: pointing the bearer server at a URL that does not require the token makes the run exit 1 with
-`the bearer-protected tool was not discovered (the token did not reach the server)`.
+Teeth checks, both run and reverted: pointing the bearer server at a URL that does not require the token makes
+the run exit 1 with `the bearer-protected tool was not discovered (the token did not reach the server)`, and
+temporarily making `toolRequiresApproval()` return `false` (i.e. removing the approval gate) makes the run exit
+1 with `a destructive tool was not gated` **and** the mock server received the destructive call - so check 6
+detects the real regression, not just the message.
 
 One environment quirk was found and documented in the script: `wrangler dev` answers a **gzip-negotiated**
 streaming response with an empty body (curl, which does not negotiate gzip, receives the real 140 bytes), so
@@ -790,8 +795,12 @@ a reason that has nothing to do with the Worker.
 Confirmed in CI: at `475c3f4` the `Test` job (Node 22 + the smoke step) passed, so all four flows hold in the
 real runtime on the pipeline too, not just on this workstation.
 
-Still unverified in workerd: an actual `tools/call` execution (tools are only invoked from the chat route, which
-needs `env.AI`; the unit suite covers the call path, the output cap and the destructive-tool gate on Node).
+Two `wrangler dev` instances run at once, so the smoke now gives each its own `--inspector-port` (they cannot
+share the default 9229) and the harness is spawned with the repository as its cwd so `pnpm exec` finds the
+project's wrangler.
+
+The output cap is still only covered on Node (`mcp.spec.ts`), because the mock returns a small payload; the
+workerd harness asserts execution and the approval gate.
 
 ### 12.4 Commits and live runs of this pass
 
