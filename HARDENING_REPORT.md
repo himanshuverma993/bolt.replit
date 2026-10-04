@@ -849,6 +849,31 @@ The new logic was behaviour-tested with a stubbed `curl` before shipping: deploy
 embeds <sha>` and the assertion proceeds; not deployed on a production run -> warning + notice + exit 0; not
 deployed on a branch run -> immediate notice and no waiting.
 
+### 12.3e The tools-enabled assertion, second iteration: gate on the stream, report the wording
+
+After the race fix, the next `main` run (`37217339645`) reached the assertion itself - the wait had confirmed
+the served bundle embedded `313c995`, the MCP server connected with tools, and `/api/chat` answered `200`
+without any MCP or binding error. The step then failed on its last line:
+
+```
+[failure] the tools-enabled chat did not answer with TOOLS_OK
+```
+
+That is a statement about **the model's wording**, not about the wiring, and it is the wrong thing to gate a
+merge on: an 8B model with a real tool list may call the tool, answer in its own words, or (as the no-tools
+probe shows) write a Bolt artifact. The step now:
+
+* gates on what must hold - HTTP 200, no MCP/Workers AI error text, no `3:` error frame, and a stream that
+  carries at least one text or tool-call frame;
+* reports the model's actual behaviour in the annotation instead of hiding it: the frame counts
+  (`text`, `toolCall`, `toolResult`, `error`) and the first 160 characters of the answer, with `TOOLS_OK`
+  reported as a notice when the model does say it and a warning when it does not;
+* asks the model to use the tool and then answer, so a successful run documents the tool loop.
+
+The six cases were behaviour-tested against canned streams before shipping: plain `TOOLS_OK`, an artifact
+containing it, a tool call + result + answer, an empty stream (`empty_stream`), an error frame
+(`error_frame`, carrying the message) and a plausible answer without `TOOLS_OK` (passes with a warning).
+
 ### 12.4 Commits and live runs of this pass
 
 | Commit | Subject |
