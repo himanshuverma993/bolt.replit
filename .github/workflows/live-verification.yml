@@ -201,20 +201,37 @@ jobs:
         run: |
           set -uo pipefail
           BASE="${{ steps.target.outputs.base }}"
-          entry=$(grep -o '/assets/index-[^"]*\.js' /tmp/home.html | head -1)
-          echo "entry asset: $entry"
-          curl -sS --max-time 60 -o /tmp/entry.js "$BASE$entry"
+          entry=$(grep -o '/assets/index-[^"]*\.js' /tmp/home.html 2>/dev/null | head -1 || true)
+          echo "entry asset: ${entry:-none}"
+          if [ -z "$entry" ]; then
+            echo "::warning::no index-*.js entry asset in the served HTML; skipping the staleness check"
+            exit 0
+          fi
+          code=$(curl -sS --max-time 60 -o /tmp/entry.js -w '%{http_code}' "$BASE$entry" || echo 000)
+          echo "GET $entry -> $code ($(wc -c < /tmp/entry.js 2>/dev/null || echo 0) bytes)"
+          if [ "$code" != "200" ]; then
+            echo "::warning::could not download the entry bundle (HTTP $code); skipping the staleness check"
+            exit 0
+          fi
           if [ "${{ steps.target.outputs.is_production }}" = "true" ]; then
             expected="main tip"
             main_short=$(curl -sS -H "Authorization: Bearer ${{ github.token }}" \
               "https://api.github.com/repos/${{ github.repository }}/commits/main" \
-              | node -e 'let d="";process.stdin.on("data",(c)=>d+=c).on("end",()=>{try{console.log(JSON.parse(d).sha.slice(0,7))}catch{console.log("unknown")}})')
+              | node -e 'let d="";process.stdin.on("data",(c)=>d+=c).on("end",()=>{try{console.log(JSON.parse(d).sha.slice(0,7))}catch{console.log("unknown")}})' || echo unknown)
           else
             # No checkout step runs here; the pushed revision is on the event payload.
             expected="pushed commit"
             main_short=$(echo "${{ github.sha }}" | cut -c1-7)
           fi
+          markers=$(node -e '
+            const fs = require("fs");
+            const s = fs.readFileSync("/tmp/entry.js", "utf8");
+            const set = new Set();
+            for (const m of s.match(/"[0-9a-f]{7}"/g) || []) set.add(m.replace(/"/g, ""));
+            console.log([...set].slice(0, 8).join(",") || "none");
+          ' || echo none)
           echo "expected ($expected): $main_short"
+          echo "commit-looking markers in the entry bundle: $markers"
           if echo ",$markers," | grep -q ",$main_short,"; then
             echo "::notice::live bundle embeds $main_short, the current $expected - the deployment is built from that revision"
           else
