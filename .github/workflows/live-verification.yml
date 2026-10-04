@@ -281,6 +281,7 @@ jobs:
         env:
           RESOLVED_BASE: ${{ steps.target.outputs.base }}
           IS_PRODUCTION: ${{ steps.target.outputs.is_production }}
+          PUSHED_SHA: ${{ github.sha }}
         run: |
           set -uo pipefail
           # The branch preview has no env.AI binding, so this probe always targets
@@ -304,6 +305,56 @@ jobs:
             echo "::notice::$1 (production is not this branch's build; the assertion activates after merge)"
             exit 0
           }
+          # Deploy lag is a pipeline race, not a code defect: Workers Builds starts
+          # when the push lands, so a workflow that runs immediately can still be
+          # talking to the previous revision. On a production run this step waits
+          # (bounded) for the served bundle to embed the pushed commit before it
+          # asserts, and reports deploy lag as a warning instead of a failure - the
+          # staleness step is what watches for a deployment that never catches up.
+          # A branch run never waits: production will not serve that revision.
+          short=$(printf '%s' "$PUSHED_SHA" | cut -c1-7)
+          served=none
+
+          read_served() {
+            local homepage entry code
+            homepage=$(curl -sS --max-time 30 "$BASE/" 2>/dev/null || true)
+            entry=$(printf '%s' "$homepage" | grep -o '/assets/index-[^"]*\.js' | head -1 || true)
+            if [ -z "$entry" ]; then
+              return 1
+            fi
+            code=$(curl -sS --max-time 60 -o /tmp/tools-entry.js -w '%{http_code}' "$BASE$entry" || echo 000)
+            [ "$code" = "200" ] || return 1
+            served=$(node -e '
+              const fs = require("fs");
+              const s = fs.readFileSync("/tmp/tools-entry.js", "utf8");
+              const set = new Set();
+              for (const m of s.match(/"[0-9a-f]{7}"/g) || []) set.add(m.replace(/"/g, ""));
+              console.log([...set].slice(0, 8).join(",") || "none");
+            ' 2>/dev/null || echo none)
+            echo ",$served," | grep -q ",$short,"
+          }
+
+          if [ "$STRICT" = "1" ]; then
+            deployed=0
+            attempt=1
+            while [ "$attempt" -le 8 ]; do
+              if read_served; then
+                deployed=1
+                echo "the served bundle embeds $short"
+                break
+              fi
+              echo "attempt $attempt/8: the served bundle does not embed $short yet (markers=$served)"
+              attempt=$((attempt + 1))
+              if [ "$attempt" -le 8 ]; then sleep 30; fi
+            done
+            if [ "$deployed" != "1" ]; then
+              echo "::warning::the deployment does not serve $short yet (served=$served); skipping the tools-enabled chat assertion in this run"
+              echo "::notice::deploy lag, not a code defect - rerun this workflow once Workers Builds has finished"
+              exit 0
+            fi
+          else
+            echo "::notice::branch run: production serves a different revision, so the tools-enabled chat below is a best-effort signal"
+          fi
           echo "probing $BASE"
           rm -f /tmp/tools.jar
           code=$(curl -sS --max-time 60 -o /tmp/mcp-tools.json -w '%{http_code}' -X POST "$BASE/api/mcp" \
