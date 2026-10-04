@@ -26,6 +26,13 @@ jobs:
       - name: Run tests
         run: pnpm run test
 
+      # Wrangler 4 requires Node >= 22 while this repository pins Node 20 for the
+      # build/test steps, so the smoke test gets its own Node.
+      - name: Use Node.js 22 for the Workers runtime smoke test
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       # Node allows `new Function`/`eval`; workerd does not. This smoke test runs
       # the built Worker in local workerd and connects it to a mock MCP server
       # whose tool publishes an `outputSchema`, which is the path that used to fail
