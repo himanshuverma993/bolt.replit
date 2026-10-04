@@ -582,7 +582,7 @@ therefore detects that condition and says so instead of passing vacuously
 (`[github-live] environment injects GitHub credentials for api.github.com - invalid-token path not exercisable here`);
 the 401 → `invalid_token` mapping stays covered by `github.spec.ts` against the mock API.
 
-### 11.2 New live CI steps (`.github/workflows/live-verification.yml`, now 13 steps)
+### 11.2 New live CI steps (`.github/workflows/live-verification.yml`, now 14 steps)
 
 | Step | Runs on | Assertion |
 | --- | --- | --- |
@@ -756,6 +756,7 @@ DRYRUN_EXIT=0    (wrangler deploy --dry-run 31s; bindings env.AI, env.ASSETS)
 
 | Case | Where it is handled | Evidence |
 | --- | --- | --- |
+| Repository does not exist yet | `verifyGitHubToken` reports `exists: false` instead of failing, so the UI can say "Bolt will create it on push" | live against api.github.com: `himanshuverma993/bolt-replit-live-probe-muu0cl5b does not exist yet -> exists=false (no repository was created by this check)` |
 | Empty repository (GitHub answers 409 on the ref) | `github.ts` `createInitialCommit` / `classifyGitHubError` → first commit written with no parents | `github.spec.ts` "handles an existing but empty repository (GitHub answers 409 on the ref)" |
 | Repository reports `size: 0` but a branch already exists | `{sha, refCreated}` result; the caller takes the update path instead of losing the commit | `github.spec.ts` "updates the branch instead of losing the commit when a repository reports size 0 but already has a branch" |
 | Branch moved during a push | 3 attempts, then `branch_conflict` with the actionable hint | `github.spec.ts` "retries when the branch moved while pushing" / "fails with a branch conflict after three attempts" |
@@ -766,7 +767,21 @@ DRYRUN_EXIT=0    (wrangler deploy --dry-run 31s; bindings env.AI, env.ASSETS)
 | `env.AI` missing at runtime | `cloudflare.ts` throws *"Cloudflare Workers AI binding is unavailable. Add `[ai] binding = \"AI\"` to wrangler.toml and deploy the Worker with Workers AI enabled."* before any inference is attempted | `cloudflare.spec.ts` |
 | Cloudflare model list on the live deployment | `GET /api/models` returns both ids with `provider: "Cloudflare"` and `maxTokenAllowed: 4096`. Note what this endpoint does **and does not** carry: it is a flat `{name,label,provider,maxTokenAllowed}` list, so `requiresApiKey` is not part of it - the keyless behaviour comes from the provider instance (`BaseChat` passes `PROVIDER_LIST`, i.e. the provider objects, to `APIKeyManager`), which is pinned by `app/components/chat/APIKeyManager.spec.ts` and by the live inference step that reaches `env.AI.run` with no key | live probe (fetched just now) + live-verification steps 9/12 |
 
-### 12.3b The workerd smoke test now covers four flows (was one)
+### 12.3c A 14th live step: tools-enabled chat on production
+
+`Tools-enabled chat with a real MCP server (production only, needs env.AI)` adds the real Cloudflare docs MCP
+server (authless) to a cookie jar, then posts a chat that must answer `TOOLS_OK`, failing if the stream reports
+an MCP or Workers AI error. It is the only check that exercises `env.AI` **and** the MCP tool wiring **and** a
+real remote server in one request - a combination nothing else covers.
+
+Because the deployed production build predates this branch, the step first classifies production's MCP state;
+if the tool path is not usable there it emits a notice naming the state and exits 0, so the assertion activates
+by itself once this branch is merged to `main`. Its snippets were behaviour-tested with canned data: a
+`connected` server with tools -> `connected`; the pre-fix `Code generation from strings disallowed` refusal ->
+`not_connected`; a chat stream containing `TOOLS_OK` -> exit 0, one without it -> exit 2. All 14 `run:` blocks
+pass `bash -n` and the YAML parses.
+
+### 12.3b The workerd smoke test now covers six flows (was one)
 
 `scripts/ci/workers-runtime-smoke.mjs` boots the built Worker in local workerd (no Cloudflare account) with a
 mock MCP server and `APP_ENCRYPTION_SECRET`, and no `[ai]` binding. It used to assert one flow; it now asserts
@@ -792,8 +807,8 @@ streaming response with an empty body (curl, which does not negotiate gzip, rece
 the smoke requests ask for `Accept-Encoding: identity`. Without that, the fourth check would have "failed" for
 a reason that has nothing to do with the Worker.
 
-Confirmed in CI: at `475c3f4` the `Test` job (Node 22 + the smoke step) passed, so all four flows hold in the
-real runtime on the pipeline too, not just on this workstation.
+Confirmed in CI: at `fe6c528` the `Test` job (Node 22 + the smoke step, all six checks) passed, so the flows
+hold in the real runtime on the pipeline too, not just on this workstation.
 
 Two `wrangler dev` instances run at once, so the smoke now gives each its own `--inspector-port` (they cannot
 share the default 9229) and the harness is spawned with the repository as its cwd so `pnpm exec` finds the

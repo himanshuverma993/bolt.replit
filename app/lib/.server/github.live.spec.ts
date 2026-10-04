@@ -208,6 +208,20 @@ describeLive('live GitHub route (read-only)', () => {
     expect(JSON.stringify(pushBody)).not.toContain(token!);
   });
 
+  it('reports a repository that does not exist yet as creatable instead of failing', async () => {
+    const missing = `bolt-replit-live-probe-${Date.now().toString(36)}`;
+    const probed = await verifyGitHubToken({ token: token!, repo: `${connection?.login ?? ''}/${missing}` });
+
+    expect(probed.repoAccess?.exists).toBe(false);
+    expect(probed.repoAccess?.push).toBeNull();
+
+    console.log(
+      `[github-live] ${probed.repoAccess?.repository} does not exist yet -> exists=${String(
+        probed.repoAccess?.exists,
+      )} (no repository was created by this check)`,
+    );
+  });
+
   it('re-verifies permissions and clears the sealed session on disconnect', async () => {
     const connect = await action({
       request: post({ action: 'connect', token: token!, repo: probeRepo }),

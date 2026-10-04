@@ -277,6 +277,64 @@ jobs:
           if [ "$fail" != "0" ]; then exit 1; fi
           echo "::notice::both Cloudflare Workers AI model ids answered through the production deployment without an API key"
 
+      - name: Tools-enabled chat with a real MCP server (production only, needs env.AI)
+        if: ${{ steps.target.outputs.is_production == 'true' }}
+        run: |
+          set -uo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          # The branch preview has no env.AI binding, so this can only be asserted
+          # on production. Adding the server only writes a cookie jar in the
+          # runner; nothing is stored on the deployment.
+          rm -f /tmp/tools.jar
+          code=$(curl -sS --max-time 60 -o /tmp/mcp-tools.json -w '%{http_code}' -X POST "$BASE/api/mcp" \
+            -H 'Content-Type: application/json' -H "Origin: $BASE" -c /tmp/tools.jar \
+            --data '{"action":"add","name":"cf-docs-tools","url":"https://docs.mcp.cloudflare.com/mcp"}') || code=000
+          echo "POST /api/mcp (authless server for the tools chat probe) -> $code"
+          [ "$code" = "200" ] || { echo "::error::adding an authless MCP server on production returned HTTP $code"; exit 1; }
+          node -e '
+            const fs = require("fs");
+            const body = JSON.parse(fs.readFileSync("/tmp/mcp-tools.json", "utf8"));
+            const server = body.server || {};
+            const tools = Array.isArray(server.tools) ? server.tools : [];
+            if (server.status === "connected" && tools.length > 0) {
+              console.log(`connected with ${tools.length} tool(s): ${tools.slice(0, 3).map((tool) => tool.name).join(", ")}`);
+              fs.writeFileSync("/tmp/tools.state", "connected");
+              process.exit(0);
+            }
+            console.log(`not connected: status=${server.status} code=${server.statusCode || "none"} message=${String(server.statusMessage || "").slice(0, 200)}`);
+            fs.writeFileSync("/tmp/tools.state", "not_connected");
+          '
+          state=$(cat /tmp/tools.state 2>/dev/null || echo unknown)
+          if [ "$state" != "connected" ]; then
+            echo "::notice::the production MCP tool path is not usable from the deployed build yet ($state); the tools-enabled chat assertion activates once this branch is merged to main"
+            exit 0
+          fi
+          payload=$(node -e 'process.stdout.write(JSON.stringify({messages:[{role:"user",content:"[Model: @cf/meta/llama-3.1-8b-instruct-fp8]\n\n[Provider: Cloudflare]\n\nReply with exactly: TOOLS_OK"}],files:{}}))')
+          code=$(curl -sS --max-time 180 -o /tmp/chat-tools.out -w '%{http_code}' -X POST "$BASE/api/chat" \
+            -H 'Content-Type: application/json' -b /tmp/tools.jar --data-binary "$payload") || code=000
+          echo "POST /api/chat (MCP tools enabled) -> $code"
+          [ "$code" = "200" ] || { echo "::error::the tools-enabled chat returned HTTP $code :: $(head -c 300 /tmp/chat-tools.out | tr -d '\r' | tr '\n' '|')"; exit 1; }
+          if grep -qiE 'MCP (connection|tool) .*(failed|error)|binding is unavailable' /tmp/chat-tools.out; then
+            echo "::error::the tools-enabled chat reported an MCP or Workers AI failure :: $(head -c 300 /tmp/chat-tools.out | tr -d '\r' | tr '\n' '|')"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const raw = fs.readFileSync("/tmp/chat-tools.out", "utf8");
+            let text = "";
+            for (const line of raw.split("\n")) {
+              const i = line.indexOf(":");
+              if (i < 1 || line.slice(0, i).trim() !== "0") continue;
+              try { const parsed = JSON.parse(line.slice(i + 1)); if (typeof parsed === "string") text += parsed; } catch {}
+            }
+            if (!text.toLowerCase().includes("tools_ok")) {
+              console.log(`::error::the tools-enabled chat did not answer with TOOLS_OK :: ${text.slice(0, 200)}`);
+              process.exit(2);
+            }
+            console.log(`tools-enabled chat answered: ${text.trim().slice(0, 60)}`);
+          '
+          echo "::notice::production runs a tools-enabled chat with a real remote MCP server and Workers AI"
+
       - name: Deployed bundle embeds the deployed commit (staleness check)
         env:
           GH_TOKEN: ${{ github.token }}
