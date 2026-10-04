@@ -232,10 +232,20 @@ jobs:
           fi
 
       - name: Both Cloudflare model ids answer through the production deployment
-        if: ${{ steps.target.outputs.is_production == 'true' }}
+        env:
+          RESOLVED_BASE: ${{ steps.target.outputs.base }}
+          IS_PRODUCTION: ${{ steps.target.outputs.is_production }}
         run: |
           set -uo pipefail
-          BASE="${{ steps.target.outputs.base }}"
+          # The branch preview has no Workers AI binding (empty [previews] block),
+          # so the inference probe always targets the production deployment. It is
+          # read-only: the model answers with a fixed string.
+          if [ "$IS_PRODUCTION" = "true" ]; then
+            BASE="$RESOLVED_BASE"
+          else
+            BASE="https://bolt-replit.biharzone37.workers.dev"
+          fi
+          echo "probing $BASE"
           fail=0
           for model in '@cf/meta/llama-3.1-8b-instruct-fp8' '@cf/meta/llama-3.3-70b-instruct-fp8-fast'; do
             payload=$(node -e 'process.stdout.write(JSON.stringify({messages:[{role:"user",content:`[Model: ${process.argv[1]}]\n\n[Provider: Cloudflare]\n\nReply with exactly: LIVE_OK`}],files:{}}))' "$model")
