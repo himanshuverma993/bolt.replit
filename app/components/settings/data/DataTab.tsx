@@ -5,6 +5,8 @@ import { toast } from 'react-toastify';
 import { db, deleteById, getAll } from '~/lib/persistence';
 import { logStore } from '~/lib/stores/logs';
 import { classNames } from '~/utils/classNames';
+import { assertExportIsCredentialFree, buildSettingsExport, filterImportedSettings } from '~/lib/settings/export';
+import { purgeLegacyGitHubCookies } from '~/lib/github/client';
 
 // List of supported providers that can have API keys
 const API_KEY_PROVIDERS = [
@@ -103,24 +105,25 @@ export default function DataTab() {
   };
 
   const handleExportSettings = () => {
-    const settings = {
-      providers: Cookies.get('providers'),
-      isDebugEnabled: Cookies.get('isDebugEnabled'),
-      isEventLogsEnabled: Cookies.get('isEventLogsEnabled'),
-      isLocalModelsEnabled: Cookies.get('isLocalModelsEnabled'),
-      promptId: Cookies.get('promptId'),
-      isLatestBranch: Cookies.get('isLatestBranch'),
-      commitHash: Cookies.get('commitHash'),
-      eventLogs: Cookies.get('eventLogs'),
-      selectedModel: Cookies.get('selectedModel'),
-      selectedProvider: Cookies.get('selectedProvider'),
-      githubUsername: Cookies.get('githubUsername'),
-      githubToken: Cookies.get('githubToken'),
-      bolt_theme: localStorage.getItem('bolt_theme'),
-    };
+    /*
+     * Defence in depth: drop any legacy credential cookie before building the
+     * payload, then assert the payload is credential-free.
+     */
+    purgeLegacyGitHubCookies();
+
+    const settings = buildSettingsExport((name) => Cookies.get(name), localStorage.getItem('bolt_theme'));
+
+    try {
+      assertExportIsCredentialFree(settings);
+    } catch (error) {
+      logStore.logError('Refused to export settings', error);
+      toast.error(error instanceof Error ? error.message : 'Settings export refused');
+
+      return;
+    }
 
     downloadAsJson(settings, 'bolt-settings.json');
-    toast.success('Settings exported successfully');
+    toast.success('Settings exported successfully (GitHub tokens are never included)');
   };
 
   const handleImportSettings = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -134,17 +137,24 @@ export default function DataTab() {
 
     reader.onload = (e) => {
       try {
-        const settings = JSON.parse(e.target?.result as string);
+        const parsed = JSON.parse(e.target?.result as string) as Record<string, unknown>;
+        const { accepted, rejectedKeys } = filterImportedSettings(parsed);
 
-        Object.entries(settings).forEach(([key, value]) => {
+        Object.entries(accepted).forEach(([key, value]) => {
           if (key === 'bolt_theme') {
             if (value) {
-              localStorage.setItem(key, value as string);
+              localStorage.setItem(key, value);
             }
           } else if (value) {
-            Cookies.set(key, value as string);
+            Cookies.set(key, value);
           }
         });
+
+        if (rejectedKeys.length > 0) {
+          toast.warn(
+            `Ignored credential-shaped entries that are never imported or exported: ${rejectedKeys.join(', ')}`,
+          );
+        }
 
         toast.success('Settings imported successfully. Please refresh the page for changes to take effect.');
       } catch (error) {

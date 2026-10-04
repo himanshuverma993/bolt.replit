@@ -17,7 +17,7 @@ import { renderLogger } from '~/utils/logger';
 import { EditorPanel } from './EditorPanel';
 import { Preview } from './Preview';
 import useViewport from '~/lib/hooks';
-import Cookies from 'js-cookie';
+import { connectGitHub, fetchGitHubStatus, GitHubClientError } from '~/lib/github/client';
 
 interface WorkspaceProps {
   chatStarted?: boolean;
@@ -170,32 +170,44 @@ export const Workbench = memo(({ chatStarted, isStreaming }: WorkspaceProps) => 
                     </PanelHeaderButton>
                     <PanelHeaderButton
                       className="mr-1 text-sm"
-                      onClick={() => {
+                      onClick={async () => {
                         const repoName = prompt(
                           'Please enter a name for your new GitHub repository:',
                           'bolt-generated-project',
                         );
 
                         if (!repoName) {
-                          alert('Repository name is required. Push to GitHub cancelled.');
+                          toast.info('Repository name is required. Push to GitHub cancelled.');
                           return;
                         }
 
-                        const githubUsername = Cookies.get('githubUsername');
-                        const githubToken = Cookies.get('githubToken');
+                        try {
+                          const status = await fetchGitHubStatus();
 
-                        if (!githubUsername || !githubToken) {
-                          const usernameInput = prompt('Please enter your GitHub username:');
-                          const tokenInput = prompt('Please enter your GitHub personal access token:');
+                          if (status.connected !== true) {
+                            const tokenInput = prompt(
+                              'GitHub token (verified and stored encrypted on the server, never in a browser cookie):',
+                            );
 
-                          if (!usernameInput || !tokenInput) {
-                            alert('GitHub username and token are required. Push to GitHub cancelled.');
-                            return;
+                            if (!tokenInput) {
+                              toast.info('Push to GitHub cancelled. Connect GitHub in Settings → Connection.');
+                              return;
+                            }
+
+                            await connectGitHub({ token: tokenInput });
                           }
 
-                          workbenchStore.pushToGitHub(repoName, usernameInput, tokenInput);
-                        } else {
-                          workbenchStore.pushToGitHub(repoName, githubUsername, githubToken);
+                          const result = await workbenchStore.pushToGitHub(repoName);
+                          toast.success(
+                            `Pushed ${result.filesWritten} file(s) to ${result.owner}/${result.repo} (${result.branch}).`,
+                          );
+                          window.open(result.htmlUrl, '_blank', 'noopener,noreferrer');
+                        } catch (error) {
+                          if (error instanceof GitHubClientError) {
+                            toast.error(error.hint ? `${error.message} ${error.hint}` : error.message);
+                          } else {
+                            toast.error(error instanceof Error ? error.message : 'Push to GitHub failed');
+                          }
                         }
                       }}
                     >

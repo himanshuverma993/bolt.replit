@@ -18,5 +18,9 @@ interface Env {
   PERPLEXITY_API_KEY: string;
   ASSETS: Fetcher;
   AI: Ai;
+  /** Preferred secret for sealing GitHub/MCP credentials (see HARDENING_REPORT.md). */
+  APP_ENCRYPTION_SECRET?: string;
+  /** Fallback secret names kept for backwards compatibility with previous deployments. */
+  GITHUB_COOKIE_SECRET?: string;
   MCP_COOKIE_SECRET?: string;
 }

@@ -19,6 +19,13 @@ describe('getErrorMessage', () => {
     expect(message).not.toContain('do-not-send-this-value');
   });
 
+  it('redacts bare vendor key shapes that appear without a key= prefix', () => {
+    const message = getErrorMessage(new Error('Upstream rejected sk-ant-api03-abcdefghijklmnopqrstuvwxyz'));
+
+    expect(message).toContain('[redacted-api-key]');
+    expect(message).not.toContain('sk-ant-api03-abcdefghijklmnopqrstuvwxyz');
+  });
+
   it('summarizes structured provider responses without returning the request body', () => {
     const message = getErrorMessage({
       message: 'Provider request failed',
