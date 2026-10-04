@@ -112,6 +112,8 @@ function startWorker(port, mcpPort) {
 
   writeFileSync(configPath, config);
   log(`mock MCP server on http://127.0.0.1:${mcpPort}/mcp`);
+  log(`node ${process.version}, CI=${process.env.CI ?? 'unset'}`);
+  log(`spawning: pnpm exec wrangler dev -c <tmp>/wrangler.smoke.toml --port ${port} --ip 127.0.0.1`);
 
   const child = spawn(
     'pnpm',
@@ -122,6 +124,7 @@ function startWorker(port, mcpPort) {
 
   child.stdout.on('data', (chunk) => output.push(String(chunk)));
   child.stderr.on('data', (chunk) => output.push(String(chunk)));
+  child.on('error', (error) => output.push(`spawn error: ${error.message}\n`));
 
   return { child, output, configDir };
 }
@@ -197,6 +200,19 @@ async function main() {
   if (failure) {
     console.error(`[smoke] FAILED: ${failure}`);
     console.error(`[smoke] wrangler output tail:\n${output.join('').slice(-3000)}`);
+
+    /*
+     * GitHub Actions turns `::error::` lines into check-run annotations, which is
+     * the only failure detail that is readable without the raw job log.
+     */
+    console.log(`::error::workers runtime smoke test failed: ${String(failure).slice(0, 500)}`);
+
+    for (const line of output.join('').split('\n').slice(-12)) {
+      if (line.trim()) {
+        console.log(`::error::wrangler: ${line.slice(0, 400)}`);
+      }
+    }
+
     process.exitCode = 1;
   } else {
     console.log('[smoke] OK');
