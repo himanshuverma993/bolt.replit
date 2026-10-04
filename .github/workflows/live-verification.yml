@@ -210,8 +210,9 @@ jobs:
               "https://api.github.com/repos/${{ github.repository }}/commits/main" \
               | node -e 'let d="";process.stdin.on("data",(c)=>d+=c).on("end",()=>{try{console.log(JSON.parse(d).sha.slice(0,7))}catch{console.log("unknown")}})')
           else
+            # No checkout step runs here; the pushed revision is on the event payload.
             expected="pushed commit"
-            main_short=$(git rev-parse --short HEAD)
+            main_short=$(echo "${{ github.sha }}" | cut -c1-7)
           fi
           echo "expected ($expected): $main_short"
           if echo ",$markers," | grep -q ",$main_short,"; then
