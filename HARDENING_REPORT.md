@@ -764,3 +764,24 @@ DRYRUN_EXIT=0    (wrangler deploy --dry-run 31s; bindings env.AI, env.ASSETS)
 | GitHub App installation token | `tokenKind: installation`, `repoCreate: not_allowed`, VCS import still allowed | `github.spec.ts` + the live route suite (`himanshuverma993`, installation) |
 | `env.AI` missing at runtime | `cloudflare.ts` throws *"Cloudflare Workers AI binding is unavailable. Add `[ai] binding = \"AI\"` to wrangler.toml and deploy the Worker with Workers AI enabled."* before any inference is attempted | `cloudflare.spec.ts` |
 | Cloudflare model list on the live deployment | `GET /api/models` returns both ids with `provider: "Cloudflare"` and `maxTokenAllowed: 4096`. Note what this endpoint does **and does not** carry: it is a flat `{name,label,provider,maxTokenAllowed}` list, so `requiresApiKey` is not part of it - the keyless behaviour comes from the provider instance (`BaseChat` passes `PROVIDER_LIST`, i.e. the provider objects, to `APIKeyManager`), which is pinned by `app/components/chat/APIKeyManager.spec.ts` and by the live inference step that reaches `env.AI.run` with no key | live probe (fetched just now) + live-verification steps 9/12 |
+
+### 12.4 Commits and live runs of this pass
+
+| Commit | Subject |
+| --- | --- |
+| `f352327` | test: pin the browser GitHub client, the GitHub route flow and the Cloudflare stream limits |
+| `4bb4d03` | test(ui): render the GitHub and MCP connection panels with React Testing Library |
+| `13ad226` | test(live): stop the live GitHub harness from ever creating a repository |
+| `2378c03` | test(ui): pin the Cloudflare keyless provider panel; record the new live notice |
+| `1053522` | docs: record the live result of the new OAuth-only MCP assertion (run `37212261741`) |
+| `8577051` | test(llm): pin the MCP tool-loop wiring in stream-text |
+
+Live runs at this pass's heads, all green: `37212261741` (`13ad226`, 13/13 steps incl. the new OAuth-only
+assertion) and `37212915553` (`8577051`, 13/13 steps, `live bundle embeds 8577051`). Local gates at
+`8577051`: install / `tsc` / `eslint` / vitest (175 passed, 6 opt-in skips) / build / `wrangler deploy --dry-run`
+= 6/6 exit 0.
+
+Also corrected in this pass: the PR body was being updated through `gh pr edit`, which aborts on this
+repository with a GraphQL `Projects (classic)` deprecation error while still exiting non-zero, so the body had
+silently stayed at an older revision. It is now written through the REST API
+(`gh api -X PATCH repos/.../pulls/3 --input <body>.json`) and the live body contains the third-pass section.
