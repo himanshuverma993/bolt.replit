@@ -588,7 +588,7 @@ the 401 → `invalid_token` mapping stays covered by `github.spec.ts` against th
 | --- | --- | --- |
 | 9. Both Cloudflare model ids answer through the production deployment | production | Both `@cf/meta/llama-3.1-8b-instruct-fp8` and `@cf/meta/llama-3.3-70b-instruct-fp8-fast` answer `LIVE_OK` through `/api/chat` with no API key; a failure names the model, the status and the body |
 | 10. GitHub endpoint rejects cross-origin, malformed and unauthenticated requests | branch preview | Cross-origin POST → 403, malformed body → 400, `connect` without a Worker secret → 501 naming `APP_ENCRYPTION_SECRET`, the token is never echoed, and `GET /api/github` stays free of credential-shaped values |
-| 11. MCP rejects insecure URLs and classifies a real remote server honestly | branch preview | A **public** `http://` URL is refused with 400 before any network call (see the finding below); adding a **real remote MCP server** (`https://docs.mcp.cloudflare.com/mcp`) either discovers tools (notices their names) or reports a **classified** failure - `connected` with zero tools, an unclassified error, or any token material in the response fails the step |
+| 11. MCP rejects insecure URLs and classifies a real remote server honestly | branch preview | A **public** `http://` URL is refused with 400 before any network call (see the findings below); adding a **real remote MCP server** (`https://docs.mcp.cloudflare.com/mcp`) discovers its tools - it now reports `connected` with 2 tools (`search_cloudflare_documentation`, `migrate_pages_to_workers_guide`). `connected` with zero tools, an unclassified error, or any token material in the response fails the step |
 | 12. MCP OAuth callback rejects a forged redirect without contacting the authorization server | branch preview | The forged callback must land on `reason=missing_state_cookie`, must not reflect the attacker's code or any token, and `/api/mcp/oauth/client-metadata` must advertise `token_endpoint_auth_method: none` with the callback redirect URI and no client secret |
 
 The new step found a real gap on its first live run: `POST /api/mcp` accepted
@@ -650,7 +650,22 @@ mock MCP server, and asserts `connected` plus the discovered tool. It is wired i
 and was proved to have teeth: with the fix removed it exits 1 with
 `the Worker could not connect to the mock MCP server: status=error code=unknown message=MCP connection failed: Code generation from strings disallowed for this context`;
 with the fix it exits 0 (`status=connected tools=get_page`). Because the unit suite runs on Node, only a
-workerd-based check can catch this class of defect.
+workerd-based check can catch this class of defect. Two CI details were fixed along the way: wrangler 4 requires
+Node >= 22 (the repository pins Node 20), so the smoke step installs Node 22 first, and the script now emits
+`::error::` annotations so a failure is readable from the check run.
+
+Live confirmation after the fix (run `37210413987`, branch preview at `9199216`):
+
+```
+[notice] real remote MCP server connected with 2 discovered tool(s): search_cloudflare_documentation, migrate_pages_to_workers_guide
+[notice] both Cloudflare Workers AI model ids answered through the production deployment without an API key
+[notice] forged MCP OAuth callback rejected with reason=missing_state_cookie
+[notice] GitHub token storage fails closed without a Worker secret (HTTP 501) and the token was not echoed
+[notice] live bundle embeds 9199216, the current pushed commit - the deployment is built from that revision
+```
+
+The earlier "the remote MCP server refused anonymous access" warning was therefore never a property of
+Cloudflare's server: it was this defect failing before the handshake could finish.
 
 ### 11.4 Blocked or unverified in this environment (unchanged, now restated)
 
