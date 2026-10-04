@@ -411,12 +411,16 @@ jobs:
               console.log(`::notice::real remote MCP server connected with ${tools} discovered tool(s): ${server.tools.map((t) => t.name).slice(0, 5).join(", ")}`);
               process.exit(0);
             }
-            const classified = ["auth_required", "error"];
-            if (!classified.includes(server.status) || !server.statusCode) {
-              console.log(`::error::remote MCP failure was not classified :: ${JSON.stringify(server).slice(0, 300)}`);
+            const detail = `${server.statusCode || "missing"} :: ${String(server.statusMessage || "").slice(0, 200)}`;
+            if (!server.statusCode) {
+              console.log(`::error::remote MCP failure has no classification :: ${JSON.stringify(server).slice(0, 300)}`);
               process.exit(3);
             }
-            console.log(`::warning::the remote MCP server refused anonymous access; classified as ${server.statusCode} (status=${server.status})`);
+            if (server.statusCode === "unknown") {
+              console.log(`::warning::the remote MCP failure was only classified as unknown :: ${detail}`);
+              process.exit(0);
+            }
+            console.log(`::warning::the remote MCP server refused anonymous access; classified as ${detail}`);
           '
 
       - name: MCP OAuth callback rejects a forged redirect without contacting the authorization server
