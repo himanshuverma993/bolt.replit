@@ -100,9 +100,13 @@ explicitly instead of silently falling back to insecure storage.
 ### Tests added
 
 `app/lib/.server/github.spec.ts` (20), `app/lib/.server/mcp.spec.ts` (13, rewritten), `app/lib/.server/mcp-oauth.spec.ts` (10),
-`app/routes/api.github.spec.ts` (9), `app/routes/api.mcp.spec.ts` (11), `app/lib/settings/export.spec.ts` (3),
+`app/lib/.server/github-route.spec.ts` (9), `app/lib/.server/mcp-route.spec.ts` (11), `app/lib/settings/export.spec.ts` (3),
 `app/lib/security/credential-handling.spec.ts` (5), `app/lib/modules/llm/providers/cloudflare.config.spec.ts` (4),
 `app/lib/.server/github.live.spec.ts` (opt-in live suite).
+
+The two route-level suites live in `app/lib/.server/` and import `~/routes/api.github` / `~/routes/api.mcp`:
+Remix strips server-only exports from modules inside `app/routes/`, so a spec file placed there broke the
+production build. The tests exercise the route modules; the files themselves stay out of the route tree.
 
 ---
 
@@ -151,17 +155,17 @@ Command: `pnpm exec vitest --run` (Node 22.22.3, pnpm 9.4.0). See §7 for the ex
 
 | Requirement | Test |
 |---|---|
-| GitHub token never in browser-readable state | `security/credential-handling.spec.ts` (cookie-write scan), `api.github.spec.ts` (session cookie `HttpOnly`/`Secure`), `github.spec.ts` (sealed cookie does not contain the token) |
+| GitHub token never in browser-readable state | `security/credential-handling.spec.ts` (cookie-write scan), `github-route.spec.ts` (session cookie `HttpOnly`/`Secure`), `github.spec.ts` (sealed cookie does not contain the token) |
 | GitHub token never in settings export | `settings/export.spec.ts` (export + import + `assertExportIsCredentialFree`) |
-| GitHub disconnect clears session state | `api.github.spec.ts` → "clears the session and the legacy cookies on disconnect" |
+| GitHub disconnect clears session state | `github-route.spec.ts` → "clears the session and the legacy cookies on disconnect" |
 | GitHub identity + repository permission checks | `github.spec.ts` → identity/scopes/repo permission, read-but-not-push detection, identity mismatch |
 | GitHub mocked create/update/push flow | `github.spec.ts` → create repo + first commit, update with parented commit, empty repo (409), conflict retry, 3-attempt failure |
 | GitHub API errors and rate limits | `github.spec.ts` → 401/403/404/409/429/network classification, token never in message |
-| MCP authless discovery | `mcp.spec.ts`, `api.mcp.spec.ts` |
-| MCP bearer discovery | `mcp.spec.ts` (header only), `api.mcp.spec.ts` (sealed, HttpOnly, absent from body) |
+| MCP authless discovery | `mcp.spec.ts`, `mcp-route.spec.ts` |
+| MCP bearer discovery | `mcp.spec.ts` (header only), `mcp-route.spec.ts` (sealed, HttpOnly, absent from body) |
 | MCP OAuth authorize + callback | `mcp-oauth.spec.ts` (discovery, DCR, PKCE URL, code exchange, state validation) |
 | MCP expired-token refresh | `mcp-oauth.spec.ts` → "refreshes an expired access token automatically and recovers" |
-| MCP 401/403/error classification | `mcp.spec.ts` → classification suite; `api.mcp.spec.ts` → `oauth_required` state |
+| MCP 401/403/error classification | `mcp.spec.ts` → classification suite; `mcp-route.spec.ts` → `oauth_required` state |
 | MCP protocol negotiation / malformed / timeout / output limit | `mcp.spec.ts` (DNS, TLS, timeout, network, protocol version, malformed, 16 KiB cap) |
 | MCP dangerous-tool approval | `mcp.spec.ts` (risk classification + refusal) |
 | MCP-disabled chat path | `mcp.spec.ts` → "returns no tools when MCP is disabled or unavailable" |
@@ -176,20 +180,28 @@ Command: `pnpm exec vitest --run` (Node 22.22.3, pnpm 9.4.0). See §7 for the ex
 
 ## 6. Live verification
 
+Two live runs of `.github/workflows/live-verification.yml` (GitHub's network, no secrets required):
+
+* **Production** — <https://github.com/himanshuverma993/bolt.replit/actions/runs/37203965671> (all steps green)
+* **The branch preview deployment built by Cloudflare Workers Builds** —
+  <https://github.com/himanshuverma993/bolt.replit/actions/runs/37204483345> (all steps green)
+
 | Gate | Result | Evidence |
 |---|---|---|
-| `GET /` on the live deployment | ✅ 200 | Content fetched from <https://bolt-replit.biharzone37.workers.dev/> (`<title>Bolt</title>`) |
-| `GET /api/models` | ✅ 200, 66 models, **Cloudflare provider visible with both model ids** | Response contains `@cf/meta/llama-3.1-8b-instruct-fp8` and `@cf/meta/llama-3.3-70b-instruct-fp8-fast`, provider `Cloudflare` |
-| `GET /api/mcp` | ✅ 200 `{"servers":[]}` | Direct probe |
-| Real Workers AI inference (`env.AI.run`) | see §6.1 | `.github/workflows/live-verification.yml` |
-| GitHub connection with least privilege | ⚠️ partial (read-only, see §6.2) | `github.live.spec.ts` against the real API |
-| GitHub disposable repository push/update | **BLOCKED** | see §6.2 |
-| MCP authless / bearer mock | ✅ | `mcp.spec.ts` + `api.mcp.spec.ts` against local HTTP mocks |
-| MCP OAuth mock | ✅ | `mcp-oauth.spec.ts` against a local authorization server + resource server |
-| Live Cloudflare MCP after authentication | **BLOCKED** | needs an interactive OAuth login in a real browser plus a Worker secret (see §8) |
-| Live Figma MCP after authentication | **BLOCKED** | same, plus a Figma plan that includes MCP |
-| No-MCP chat flow | ✅ | `mcp.spec.ts`; the live deployment currently has no MCP servers configured, so live chat is on the no-tool path |
-| Deployment version | ✅ | The live bundle serves the Cloudflare models and the MCP route added in `b3b6ec4`, i.e. the merged version is deployed |
+| `GET /` + asset delivery | ✅ 200, `<title>Bolt</title>`, hashed asset 200 | production run, step 3 |
+| `GET /api/models` | ✅ 200, Cloudflare provider with both `@cf/...` model ids | production run, step 4 |
+| `GET /api/mcp` | ✅ 200 | production run, step 5 |
+| `/api/github` status endpoint | ✅ 404 on production (the route is added by this PR) and **✅ 200 on the branch preview** with no token-shaped value in the payload | preview run, step 6 (404 → documented warning on production) |
+| Real Workers AI inference (`env.AI.run`) | ✅ production: `POST /api/chat` → HTTP 200, AI SDK v4 data stream (`0:"..."` frames) whose concatenated text contains `LIVE_OK` | production run, step 7 |
+| Clear error when the binding is missing | ✅ the preview deployment (no `env.AI`, see §8.2) returns `Cloudflare Workers AI binding is unavailable. Add [ai] binding = "AI" to wrangler.toml and deploy the Worker with Workers AI enabled.` | preview run, step 7 |
+| Credential-shaped values in the chat error path | ✅ none (`sk-…`, `gh[pousr]_…` scan) | both runs, step 8 |
+| Deployed bundle == merged revision | ✅ the served entry bundle embeds `b3b6ec4`, the current `main` tip | production run, step 9 |
+| GitHub least-privilege connection | ⚠️ partial — read-only verification, §6.2 | `github.live.spec.ts` against the real API |
+| GitHub disposable repository create/push/update | ⛔ **BLOCKED** — needs a fine-grained PAT (§6.2, §8.4) | — |
+| MCP authless / bearer | ✅ local HTTP mocks | `mcp.spec.ts` + `mcp-route.spec.ts` |
+| MCP OAuth (discovery, DCR, PKCE, exchange, refresh) | ✅ local authorization + resource server | `mcp-oauth.spec.ts` |
+| Live Cloudflare MCP / Figma MCP after authentication | ⛔ **BLOCKED** — interactive browser login (§8.5) | — |
+| No-MCP chat flow | ✅ the live deployment has no MCP servers configured, so the live chat above ran on the no-tool path | production run, step 7 |
 
 ### 6.1 Workers AI
 
@@ -202,9 +214,13 @@ real inference probe runs from GitHub's network instead):
   (`finishReason: 'tool-calls'`, JSON-encoded args), `specificationVersion: 'v1'`.
 * `cloudflare.config.spec.ts` asserts the `[ai]` binding exists in `wrangler.toml`, that an API key is
   *not* required (`requiresApiKey === false`), and that the two model ids are exactly the verified ones.
-* The live workflow (§6.3) POSTs a Cloudflare-model chat request to the deployed Worker and fails the
-  run if `textDelta` output is missing, if the binding is unavailable, or if the provider asks for an
-  API key. Its output is the live inference evidence.
+* The live workflow (§6.3) POSTs a Cloudflare-model chat request to the deployed Worker, parses the
+  AI SDK v4 data stream (text frames are `0:"..."`) and fails the run if no text frame is produced, if
+  the concatenated text does not contain the requested `LIVE_OK` token, if the binding is unavailable
+  (production) or if the provider asks for an API key. Observed production response:
+  `0:"<b"|0:">"|0:" LIVE"|0:"_OK"|0:" </"|0:"b"|0:">"` — i.e. the model really answered through
+  `env.AI.run` with no API key. On the branch preview, where the binding is absent by configuration,
+  the same request produces the explicit actionable binding error shown in §6.
 
 ### 6.2 GitHub
 
@@ -234,10 +250,26 @@ mission forbids pushing to the production repository as a test. Therefore:
 
 ### 6.3 Live workflow
 
-`.github/workflows/live-verification.yml` runs the probes from GitHub's network (no secrets needed) and
-covers: home page + asset delivery, `/api/models` (Cloudflare visibility), `/api/mcp`, `/api/github`
-status (plus a token-shape check), **real Workers AI inference through `/api/chat`**, and a check that
-the chat error path never echoes a credential-shaped value.
+`.github/workflows/live-verification.yml` runs the probes from GitHub's network (no secrets needed) on
+every push to `arena/**` and `main`, plus manual dispatch with an optional `base_url`:
+
+1. home page + asset delivery;
+2. `/api/models` — the Cloudflare provider must expose both `@cf/...` model ids;
+3. `/api/mcp` — the hardened status endpoint;
+4. `/api/github` — must not leak token-shaped values (a 404 is tolerated with a warning for deployments
+   that predate this PR);
+5. **real Workers AI inference through `/api/chat`**, parsed as an AI SDK v4 data stream;
+6. the chat error path must not echo a credential-shaped value;
+7. the served entry bundle must embed the deployed revision (`b3b6ec4` = current `main` tip on
+   production; the pushed revision on a branch preview).
+
+A push to a branch first tries the Cloudflare Workers Builds preview alias for that branch
+(`https://<branch-slug>-bolt-replit.biharzone37.workers.dev`) and probes it when it answers; otherwise
+it probes the production URL. That is how the hardened branch code was verified live before merge: the
+preview run above answers `/api/github` with 200 and shows the new binding error message, while the
+production run shows real inference. Because GitHub blocks log downloads for this sandbox, every step
+also publishes its result as a check-run annotation, which is where the quoted evidence strings come
+from.
 
 ---
 
@@ -290,7 +322,16 @@ the baseline commit `b3b6ec4` prints the same message and also exits 0.
    precise failure if it is missing.
 4. **Tool-approval model is per server**, not per tool-per-invocation confirmation dialog; destructive
    tools are refused until the user opts the server in.
-5. `pnpm exec vitest` prints `close timed out after 10000ms … prevents Vite server from exiting`
+5. **The branch preview deployment runs without the Workers AI binding.** Cloudflare Workers Builds
+   deploys branch previews from the (intentionally empty) `[previews]` block of `wrangler.toml`, so the
+   preview has no `env.AI` while production does — verified live: the same `/api/chat` request returns
+   `LIVE_OK` on production and the explicit binding error on the preview (§6). This is a configuration
+   property of the current `wrangler.toml`, not a code path; the AI binding was deliberately **not**
+   added to `[previews]` here to preserve the existing intentional configuration.
+6. **GitHub Actions job logs cannot be downloaded from this sandbox** (`results-receiver.actions.githubusercontent.com`
+   is not reachable), so every workflow step publishes its result and the relevant response excerpts as
+   check-run annotations; those annotations are the quoted live evidence in §6.
+7. `pnpm exec vitest` prints `close timed out after 10000ms … prevents Vite server from exiting`
    (pre-existing, exit code stays 0) — noise, not a failure.
 
 ### Manual steps required from the user
@@ -322,13 +363,26 @@ the baseline commit `b3b6ec4` prints the same message and also exits 0.
    and complete the provider login. Bolt registers its OAuth client dynamically (or via the served
    client-metadata document) and stores the tokens sealed. A Figma plan with MCP access is required
    for the Figma server.
-6. **Workers AI**: nothing to configure — the `[ai]` binding is already in `wrangler.toml`; the live
-   workflow proves `env.AI.run` works on the deployment.
+6. **Workers AI**: nothing to configure — the `[ai]` binding is already in `wrangler.toml`, and the live
+   workflow proves `env.AI.run` works on the production deployment (branch previews deploy without it,
+   see limitation 5).
+7. **Optional**: if branch previews should also exercise Workers AI, add an AI binding inside the
+   existing `[previews]` block of `wrangler.toml`. This was deliberately left untouched because the
+   empty block is part of the current intentional configuration.
 
 ---
 
 ## 9. Commits and PR
 
-Filled in after the branch was pushed — see the PR description for the exact hashes:
-**PR:** <https://github.com/himanshuverma993/bolt.replit/pulls> (please see the PR opened from
-`arena/01a106dd-bolt-replit`).
+* Base: `b3b6ec4` — the tip of `main` when this work started. `main` was never pushed to or merged by
+  this session.
+* Hardening commit: **`37e2df7`** — `fix(security): server-side GitHub auth, MCP OAuth and hardened credentials`
+  (application code, tests, `HARDENING_REPORT.md`).
+* Follow-up commits on the branch are CI-only and touch `.github/workflows/live-verification.yml`
+  exclusively: `5369666`, `8103fa9`, `26b5671`, `dcba1eb`, `efc5285`, `cff1d34`, `9f9c040`, `974b5b7`,
+  `6abdb6e`, `0c42a4c`.
+* Branch: `arena/01a106dd-bolt-replit`
+* **PR: <https://github.com/himanshuverma993/bolt.replit/pull/3>**
+
+Both live runs referenced in §6 are attached to this branch: production was probed at the merged `main`
+revision and the branch preview at the hardened revision.
