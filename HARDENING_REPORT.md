@@ -695,15 +695,28 @@ and Cloudflare connections get another, deeper pass. This section records only w
 | `app/lib/modules/llm/providers/cloudflare.spec.ts` (6 → 9 tests) | `usage` and `finish_reason` are lifted out of the streamed frames; a stream larger than the 1 MiB safety cap raises an explicit error instead of truncating silently; `max_tokens`, `temperature` and `top_p` reach the binding, and are omitted when the caller did not set them | 9 passed |
 | `app/entry.client.tsx` | Legacy GitHub credential cookies are expired on **every** page load (before hydration), not only when the Settings → Connections tab happens to be opened | build + unit gate |
 
+### 12.1b Rendered UI tests (the closest available substitute for a browser)
+
+There is still no browser in this environment (§11.4), so the two connection panels are now rendered for
+real with React Testing Library under `happy-dom`. Only `fetch` is stubbed, which means the components run
+against the **real** client modules and the assertions cover the DOM a user would see. Two dev-only
+dependencies were added for this: `@testing-library/react` 16.3.3 + `@testing-library/dom` 10.4.2 and
+`happy-dom` 15.11.7.
+
+| Suite | What it proves | Result |
+| --- | --- | --- |
+| `app/components/settings/connections/ConnectionsTab.spec.ts` (5 tests) | The GitHub panel as rendered: the missing-secret banner and a disabled Connect button when storage is not configured; Connect sends exactly `{action:'connect', token, repo}` with the token **only in the JSON body**, then renders the verified card (login, installation-token explanation, "repository creation not permitted", repository access, `GitHub authentication: valid`) and removes the token input from the DOM; a 403 renders the server's message **and its hint** and refreshes the status; opening the panel purges the legacy `githubToken`/`git:github.com`/`githubUsername` cookies; Disconnect posts `{action:'disconnect'}` and returns to the form; Verify re-verifies and drops the "stale" marker. In every case `document.cookie` and `document.body.innerHTML` contain no token | 5 passed |
+| `app/components/settings/connections/McpConnections.spec.ts` (6 tests) | The MCP panel as rendered: an OAuth-only server shows "Authentication required" plus a **Connect with OAuth** action and never "Connected"; the catalog buttons advertise Cloudflare and Figma as `(OAuth required)` and `Use Cloudflare` fills `https://mcp.cloudflare.com/mcp`; adding that server without a token is classified as auth-required instead of silently connecting, while the bearer token travels only in the JSON body and appears nowhere in the DOM; a `javascript:` **and** a plain-`http` remote authorization URL are both refused by the client; a classified failure keeps its `[http_401]` code, message and hint; the risky-tool checkbox posts `set-allow-risky` with `allowRiskyTools: true`; an OAuth callback result (`?mcp_oauth=error&reason=missing_state_cookie`) is surfaced and stripped from the URL; the missing-credential-secret warning and warnings list render, `Revoke OAuth` only appears for a connected OAuth server, and Remove deletes the server through the API | 6 passed |
+
 ### 12.2 Local gates at this head
 
 ```
-INSTALL_EXIT=0   (install 6s)
+INSTALL_EXIT=0   (install 5s, frozen lockfile)
 TYPECHECK_EXIT=0 (tsc 11s)
 LINT_EXIT=0      (eslint 2s)
-TESTS_EXIT=0     (vitest: 158 passed | 6 skipped, 18 files passed + 1 skipped)
-BUILD_EXIT=0     (remix vite:build 30s)
-DRYRUN_EXIT=0    (wrangler deploy --dry-run 32s; 3478.93 KiB / gzip 691.04 KiB; bindings env.AI, env.ASSETS)
+TESTS_EXIT=0     (vitest: 169 passed | 6 skipped, 20 files passed + 1 skipped)
+BUILD_EXIT=0     (remix vite:build 29s)
+DRYRUN_EXIT=0    (wrangler deploy --dry-run 31s; bindings env.AI, env.ASSETS)
 ```
 
 ### 12.3 Real-world GitHub and Cloudflare cases re-checked in this pass
