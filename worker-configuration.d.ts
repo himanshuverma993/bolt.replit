@@ -1,5 +1,5 @@
 interface Env {
-  DEFAULT_NUM_CTX:Settings;
+  DEFAULT_NUM_CTX: Settings;
   ANTHROPIC_API_KEY: string;
   OPENAI_API_KEY: string;
   GROQ_API_KEY: string;
@@ -16,4 +16,7 @@ interface Env {
   MISTRAL_API_KEY: string;
   XAI_API_KEY: string;
   PERPLEXITY_API_KEY: string;
+  ASSETS: Fetcher;
+  AI: Ai;
+  MCP_COOKIE_SECRET?: string;
 }

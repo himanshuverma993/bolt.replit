@@ -15,6 +15,7 @@ import ignore from 'ignore';
 import type { IProviderSetting } from '~/types/model';
 import { PromptLibrary } from '~/lib/common/prompt-library';
 import { allowedHTMLElements } from '~/utils/markdown';
+import { getMcpTools, MCP_MAX_STEPS } from '~/lib/.server/mcp';
 
 interface ToolResult<Name extends string, Args, Result> {
   toolCallId: string;
@@ -150,8 +151,9 @@ export async function streamText(props: {
   files?: FileMap;
   providerSettings?: Record<string, IProviderSetting>;
   promptId?: string;
+  request?: Request;
 }) {
-  const { messages, env: serverEnv, options, apiKeys, files, providerSettings, promptId } = props;
+  const { messages, env: serverEnv, options, apiKeys, files, providerSettings, promptId, request } = props;
 
   // console.log({serverEnv});
 
@@ -200,7 +202,7 @@ export async function streamText(props: {
     systemPrompt = `${systemPrompt}\n\n ${codeContext}`;
   }
 
-  return _streamText({
+  const streamArguments = {
     model: provider.getModelInstance({
       model: currentModel,
       serverEnv,
@@ -211,5 +213,20 @@ export async function streamText(props: {
     maxTokens: dynamicMaxTokens,
     messages: convertToCoreMessages(processedMessages as any),
     ...options,
-  });
+  };
+
+  if (request) {
+    const mcpTools = await getMcpTools(request, serverEnv);
+
+    if (Object.keys(mcpTools).length > 0) {
+      return _streamText({
+        ...streamArguments,
+        tools: mcpTools,
+        maxSteps: MCP_MAX_STEPS,
+        toolChoice: 'auto',
+      });
+    }
+  }
+
+  return _streamText(streamArguments);
 }

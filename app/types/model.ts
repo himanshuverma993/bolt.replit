@@ -12,6 +12,7 @@ export type ProviderInfo = {
   getApiKeyLink?: string;
   labelForGetApiKey?: string;
   icon?: string;
+  requiresApiKey?: boolean;
 };
 
 export interface IProviderSetting {

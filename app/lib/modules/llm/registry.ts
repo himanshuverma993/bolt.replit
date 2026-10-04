@@ -1,5 +1,6 @@
 import AnthropicProvider from './providers/anthropic';
 import CohereProvider from './providers/cohere';
+import CloudflareProvider from './providers/cloudflare';
 import DeepseekProvider from './providers/deepseek';
 import GoogleProvider from './providers/google';
 import GroqProvider from './providers/groq';
@@ -17,6 +18,7 @@ import XAIProvider from './providers/xai';
 export {
   AnthropicProvider,
   CohereProvider,
+  CloudflareProvider,
   DeepseekProvider,
   GoogleProvider,
   GroqProvider,

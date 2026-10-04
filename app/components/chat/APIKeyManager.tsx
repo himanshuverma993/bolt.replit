@@ -15,6 +15,15 @@ export const APIKeyManager: React.FC<APIKeyManagerProps> = ({ provider, apiKey, 
   const [isEditing, setIsEditing] = useState(false);
   const [tempKey, setTempKey] = useState(apiKey);
 
+  if (provider.requiresApiKey === false) {
+    return (
+      <div className="mt-2 mb-4 text-xs text-bolt-elements-textSecondary">
+        <span className="text-bolt-elements-textPrimary">{provider.name}:</span> no API key needed — runs on your
+        Cloudflare account&apos;s Workers AI free tier.
+      </div>
+    );
+  }
+
   const handleSave = () => {
     setApiKey(tempKey);
     setIsEditing(false);
