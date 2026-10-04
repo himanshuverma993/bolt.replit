@@ -1,0 +1,125 @@
+name: Live verification
+
+# Live, read-only probes against a deployed Worker. Runs from GitHub's network,
+# which can reach *.workers.dev even when a local sandbox cannot.
+#
+# No secrets are required or used: every request goes to a public URL and the
+# Cloudflare Workers AI binding is exercised through the deployment itself.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: Base URL of the deployment to probe
+        required: false
+        default: https://bolt-replit.biharzone37.workers.dev
+  push:
+    branches:
+      - 'arena/**'
+      - 'main'
+
+permissions:
+  contents: read
+
+jobs:
+  live-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target
+        id: target
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.inputs.base_url || 'https://bolt-replit.biharzone37.workers.dev' }}"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "Probing $BASE"
+
+      - name: Home page and asset delivery
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          code=$(curl -sS -o /tmp/home.html -w '%{http_code}' "$BASE/")
+          echo "GET / -> $code"
+          test "$code" = "200"
+          grep -qi '<title>Bolt</title>' /tmp/home.html
+          asset=$(grep -o '/assets/[^"]*\.js' /tmp/home.html | head -1)
+          echo "asset: $asset"
+          curl -sS -o /dev/null -w 'GET %{url_effective} -> %{http_code}\n' "$BASE$asset"
+
+      - name: Model list exposes the Cloudflare provider and model ids
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          curl -sS "$BASE/api/models" -o /tmp/models.json
+          node -e '
+            const models = require("/tmp/models.json");
+            const cloudflare = models.filter((m) => m.provider === "Cloudflare");
+            console.log(`models=${models.length} cloudflare=${cloudflare.length}`);
+            console.log(cloudflare.map((m) => m.name).join("\n"));
+            if (cloudflare.length < 2) { process.exit(1); }
+            if (!cloudflare.some((m) => m.name === "@cf/meta/llama-3.1-8b-instruct-fp8")) { process.exit(1); }
+            if (!cloudflare.some((m) => m.name === "@cf/meta/llama-3.3-70b-instruct-fp8-fast")) { process.exit(1); }
+          '
+
+      - name: MCP status endpoint
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          code=$(curl -sS -o /tmp/mcp.json -w '%{http_code}' "$BASE/api/mcp")
+          echo "GET /api/mcp -> $code"
+          cat /tmp/mcp.json
+          test "$code" = "200"
+
+      - name: GitHub status endpoint reports an unconnected, secret-aware state
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          code=$(curl -sS -o /tmp/github.json -w '%{http_code}' "$BASE/api/github")
+          echo "GET /api/github -> $code"
+          cat /tmp/github.json
+          grep -qi 'connected' /tmp/github.json
+          if grep -qi 'gh[pousr]_' /tmp/github.json; then echo 'token-shaped value in status payload'; exit 1; fi
+
+      - name: Real Workers AI inference through /api/chat (Cloudflare provider, env.AI.run)
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          cat > /tmp/chat.json <<'JSON'
+          {
+            "messages": [
+              {
+                "role": "user",
+                "content": "[Model: @cf/meta/llama-3.1-8b-instruct-fp8]\n\n[Provider: Cloudflare]\n\nReply with exactly: LIVE_OK"
+              }
+            ],
+            "files": {}
+          }
+          JSON
+          code=$(curl -sS --max-time 120 -o /tmp/chat.out -w '%{http_code}' -X POST "$BASE/api/chat" \
+            -H 'Content-Type: application/json' --data-binary @/tmp/chat.json)
+          echo "POST /api/chat -> $code"
+          echo "--- data stream (first 1200 bytes) ---"
+          head -c 1200 /tmp/chat.out; echo
+          test "$code" = "200"
+          if grep -qi 'binding is unavailable' /tmp/chat.out; then
+            echo 'FAIL: Workers AI binding is not deployed on this Worker'
+            exit 1
+          fi
+          if grep -qi 'No API key\|API key' /tmp/chat.out; then
+            echo 'FAIL: Cloudflare provider asked for an API key on the native env.AI path'
+            exit 1
+          fi
+          grep -q '"textDelta"' /tmp/chat.out
+
+      - name: Confirm no credential is echoed by the chat error path
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          code=$(curl -sS --max-time 60 -o /tmp/badchat.out -w '%{http_code}' -X POST "$BASE/api/chat" \
+            -H 'Content-Type: application/json' \
+            --data '{"messages":[{"role":"user","content":"[Model: not-a-real-model]\n\n[Provider: Nope]\n\nhi"}],"files":{}}')
+          echo "POST /api/chat (invalid provider) -> $code"
+          if grep -qiE 'sk-[A-Za-z0-9]{10,}|gh[pousr]_[A-Za-z0-9]{10,}' /tmp/badchat.out; then
+            echo 'FAIL: a credential-shaped value was returned to the client'
+            exit 1
+          fi
+          echo 'no credential-shaped values in the error response'

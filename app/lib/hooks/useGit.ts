@@ -6,26 +6,37 @@ import http from 'isomorphic-git/http/web';
 import Cookies from 'js-cookie';
 import { toast } from 'react-toastify';
 
+/**
+ * Clone credentials are held in memory for this browser session only.
+ *
+ * The previous implementation persisted them in a JavaScript-readable
+ * `git:<domain>` cookie, which is exactly how a PAT leaks into page scripts and
+ * backups. Cookies of that shape are deleted when they are encountered.
+ */
+const gitAuthMemory = new Map<string, GitAuth>();
+
+const gitDomain = (url: string) => url.split('/')[2] ?? url;
+
 const lookupSavedPassword = (url: string) => {
-  const domain = url.split('/')[2];
-  const gitCreds = Cookies.get(`git:${domain}`);
+  const domain = gitDomain(url);
+  const legacyCookie = Cookies.get(`git:${domain}`);
 
-  if (!gitCreds) {
-    return null;
+  if (legacyCookie) {
+    // Migration: remove the JavaScript-readable credential cookie.
+    Cookies.remove(`git:${domain}`);
+    console.warn('Removed a legacy git credential cookie; clone credentials are now kept in memory only.');
   }
 
-  try {
-    const { username, password } = JSON.parse(gitCreds || '{}');
-    return { username, password };
-  } catch (error) {
-    console.log(`Failed to parse Git Cookie ${error}`);
-    return null;
-  }
+  return gitAuthMemory.get(domain) ?? undefined;
 };
 
 const saveGitAuth = (url: string, auth: GitAuth) => {
-  const domain = url.split('/')[2];
-  Cookies.set(`git:${domain}`, JSON.stringify(auth));
+  gitAuthMemory.set(gitDomain(url), auth);
+};
+
+/** Clears in-memory clone credentials (called by tests and on explicit sign-out). */
+export const clearInMemoryGitAuth = () => {
+  gitAuthMemory.clear();
 };
 
 export function useGit() {
@@ -60,21 +71,20 @@ export function useGit() {
         onAuth: (url) => {
           // let domain=url.split("/")[2]
 
-          let auth = lookupSavedPassword(url);
+          const auth = lookupSavedPassword(url);
 
           if (auth) {
             return auth;
           }
 
           if (confirm('This repo is password protected. Ready to enter a username & password?')) {
-            auth = {
-              username: prompt('Enter username'),
-              password: prompt('Enter password'),
+            return {
+              username: prompt('Enter username') ?? undefined,
+              password: prompt('Enter password') ?? undefined,
             };
-            return auth;
-          } else {
-            return { cancel: true };
           }
+
+          return { cancel: true };
         },
         onAuthFailure: (url, _auth) => {
           toast.error(`Error Authenticating with ${url.split('/')[2]}`);

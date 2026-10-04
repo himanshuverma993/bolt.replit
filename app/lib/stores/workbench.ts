@@ -11,11 +11,10 @@ import { PreviewsStore } from './previews';
 import { TerminalStore } from './terminal';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
-import { Octokit, type RestEndpointMethodTypes } from '@octokit/rest';
 import * as nodePath from 'node:path';
 import { extractRelativePath } from '~/utils/diff';
 import { description } from '~/lib/persistence';
-import Cookies from 'js-cookie';
+import { pushFilesToGitHub, type GitHubPushResult } from '~/lib/github/client';
 import { createSampler } from '~/utils/sampler';
 import type { ActionAlert } from '~/types/actions';
 
@@ -434,113 +433,35 @@ export class WorkbenchStore {
     return syncedFiles;
   }
 
-  async pushToGitHub(repoName: string, githubUsername?: string, ghToken?: string) {
-    try {
-      // Use cookies if username and token are not provided
-      const githubToken = ghToken || Cookies.get('githubToken');
-      const owner = githubUsername || Cookies.get('githubUsername');
+  /**
+   * Pushes the current project to GitHub through the server-side GitHub API
+   * route. The browser never receives a GitHub token: it is verified and sealed
+   * into an HttpOnly cookie by `/api/github`.
+   */
+  async pushToGitHub(
+    repoName: string,
+    options: { message?: string; branch?: string; isPrivate?: boolean } = {},
+  ): Promise<GitHubPushResult> {
+    const files = this.files.get();
+    const payload: Array<{ path: string; content: string }> = [];
 
-      if (!githubToken || !owner) {
-        throw new Error('GitHub token or username is not set in cookies or provided.');
+    for (const [filePath, dirent] of Object.entries(files)) {
+      if (dirent?.type === 'file' && !dirent.isBinary) {
+        payload.push({ path: extractRelativePath(filePath), content: dirent.content });
       }
-
-      // Initialize Octokit with the auth token
-      const octokit = new Octokit({ auth: githubToken });
-
-      // Check if the repository already exists before creating it
-      let repo: RestEndpointMethodTypes['repos']['get']['response']['data'];
-
-      try {
-        const resp = await octokit.repos.get({ owner, repo: repoName });
-        repo = resp.data;
-      } catch (error) {
-        if (error instanceof Error && 'status' in error && error.status === 404) {
-          // Repository doesn't exist, so create a new one
-          const { data: newRepo } = await octokit.repos.createForAuthenticatedUser({
-            name: repoName,
-            private: false,
-            auto_init: true,
-          });
-          repo = newRepo;
-        } else {
-          console.log('cannot create repo!');
-          throw error; // Some other error occurred
-        }
-      }
-
-      // Get all files
-      const files = this.files.get();
-
-      if (!files || Object.keys(files).length === 0) {
-        throw new Error('No files found to push');
-      }
-
-      // Create blobs for each file
-      const blobs = await Promise.all(
-        Object.entries(files).map(async ([filePath, dirent]) => {
-          if (dirent?.type === 'file' && dirent.content) {
-            const { data: blob } = await octokit.git.createBlob({
-              owner: repo.owner.login,
-              repo: repo.name,
-              content: Buffer.from(dirent.content).toString('base64'),
-              encoding: 'base64',
-            });
-            return { path: extractRelativePath(filePath), sha: blob.sha };
-          }
-
-          return null;
-        }),
-      );
-
-      const validBlobs = blobs.filter(Boolean); // Filter out any undefined blobs
-
-      if (validBlobs.length === 0) {
-        throw new Error('No valid files to push');
-      }
-
-      // Get the latest commit SHA (assuming main branch, update dynamically if needed)
-      const { data: ref } = await octokit.git.getRef({
-        owner: repo.owner.login,
-        repo: repo.name,
-        ref: `heads/${repo.default_branch || 'main'}`, // Handle dynamic branch
-      });
-      const latestCommitSha = ref.object.sha;
-
-      // Create a new tree
-      const { data: newTree } = await octokit.git.createTree({
-        owner: repo.owner.login,
-        repo: repo.name,
-        base_tree: latestCommitSha,
-        tree: validBlobs.map((blob) => ({
-          path: blob!.path,
-          mode: '100644',
-          type: 'blob',
-          sha: blob!.sha,
-        })),
-      });
-
-      // Create a new commit
-      const { data: newCommit } = await octokit.git.createCommit({
-        owner: repo.owner.login,
-        repo: repo.name,
-        message: 'Initial commit from your app',
-        tree: newTree.sha,
-        parents: [latestCommitSha],
-      });
-
-      // Update the reference
-      await octokit.git.updateRef({
-        owner: repo.owner.login,
-        repo: repo.name,
-        ref: `heads/${repo.default_branch || 'main'}`, // Handle dynamic branch
-        sha: newCommit.sha,
-      });
-
-      alert(`Repository created and code pushed: ${repo.html_url}`);
-    } catch (error) {
-      console.error('Error pushing to GitHub:', error);
-      throw error; // Rethrow the error for further handling
     }
+
+    if (payload.length === 0) {
+      throw new Error('There are no text files to push yet. Ask the Agent to create a project first.');
+    }
+
+    return pushFilesToGitHub({
+      repoName,
+      files: payload,
+      message: options.message,
+      branch: options.branch,
+      isPrivate: options.isPrivate,
+    });
   }
 }
 

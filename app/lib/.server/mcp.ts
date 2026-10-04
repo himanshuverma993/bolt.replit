@@ -1,6 +1,53 @@
+/**
+ * MCP (Model Context Protocol) client for bolt-replit.
+ *
+ * Transport: Streamable HTTP only (the current official transport). Nothing is
+ * ever upgraded to SSE by force.
+ *
+ * Security model
+ * --------------
+ *  - Server *configuration* (names, URLs, enabled flag, tool list) is stored in
+ *    the `mcpServers` cookie. When a Worker secret is configured that cookie is
+ *    HMAC signed, so a client cannot rewrite a stored server URL and make Bolt
+ *    send an existing credential to an attacker-controlled host.
+ *  - Credentials (bearer tokens, OAuth tokens, PKCE verifiers, client
+ *    registrations) live in separate AES-256-GCM sealed, HttpOnly, Secure
+ *    cookies. Page JavaScript can neither read nor forge them.
+ *  - Cookies written by the previous implementation (unsigned config, opaque
+ *    secrets cookie without a signature) are dropped and reported to the UI
+ *    instead of being trusted.
+ *  - Destructive/write tools require an explicit per-server opt-in; the
+ *    decision is enforced on the server, not in the model prompt.
+ *
+ * Limits are unchanged from the previous version: 10 s per request, 16 KiB tool
+ * output, 3 tool-loop steps, 12 KiB of public server state.
+ */
+
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { jsonSchema, tool, type CoreTool } from 'ai';
+import {
+  clearCookie,
+  decodeSignedCookieValue,
+  encodeSignedCookieValue,
+  getRequestOrigin,
+  isSecureOrigin,
+  openJsonPayload,
+  readRequestCookies,
+  redactSecrets,
+  resolveAppSecret,
+  sealJsonPayload,
+  serializeCookie,
+  type SecretEnvironment,
+} from '~/lib/.server/secrets';
+import {
+  isMcpOAuthConfigured,
+  oauthStoreHeaders,
+  readOAuthStore,
+  requireOAuthSecret,
+  transportAuthProvider,
+  type McpOAuthStore,
+} from '~/lib/.server/mcp-oauth';
 
 export const MCP_PUBLIC_COOKIE = 'mcpServers';
 export const MCP_SECRET_COOKIE = 'mcpSecrets';
@@ -9,130 +56,266 @@ export const MCP_REQUEST_TIMEOUT_MS = 10_000;
 export const MCP_MAX_TOOL_OUTPUT = 16 * 1024;
 export const MCP_MAX_STEPS = 3;
 export const MCP_MAX_PUBLIC_COOKIE_BYTES = 12 * 1024;
+export const MCP_TOOL_DESCRIPTION_LIMIT = 500;
 
 export type McpToolInfo = {
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  risk: McpToolRisk;
 };
 
-export type McpServerStatus = 'connected' | 'error';
+export type McpToolRisk = 'read' | 'write' | 'destructive';
+
+export type McpAuthMode = 'authless' | 'bearer' | 'oauth';
+
+export type McpServerStatus = 'connected' | 'error' | 'auth_required';
+
+export type McpErrorCode =
+  | 'dns'
+  | 'network'
+  | 'tls'
+  | 'http_401'
+  | 'http_403'
+  | 'oauth_required'
+  | 'invalid_bearer_token'
+  | 'unsupported_transport'
+  | 'protocol_negotiation_failed'
+  | 'tools_list_failed'
+  | 'tools_call_failed'
+  | 'timeout'
+  | 'invalid_request'
+  | 'not_configured'
+  | 'malformed_response'
+  | 'unknown';
 
 export type McpServerConfig = {
   id: string;
   name: string;
   url: string;
   enabled: boolean;
+  authMode: McpAuthMode;
   status: McpServerStatus;
   statusMessage?: string;
+  statusCode?: McpErrorCode;
+  statusHint?: string;
+
+  /** Explicit opt-in for write/destructive tools. Defaults to false. */
+  allowRiskyTools?: boolean;
   tools: McpToolInfo[];
+  addedAt?: string;
+  lastCheckedAt?: string;
 };
 
-type McpSecretState = Record<string, string>;
+export type McpSecretState = Record<string, string>;
 
-type CookieOptions = {
-  httpOnly?: boolean;
-  maxAge?: number;
+export type McpState = {
+  servers: McpServerConfig[];
+  secrets: McpSecretState;
+  oauth: McpOAuthStore;
+
+  /** Non-fatal problems the UI must show (reset config, dropped cookies, ...). */
+  warnings: string[];
 };
 
-function parseCookies(request: Request): Record<string, string> {
-  const header = request.headers.get('Cookie') ?? '';
-  const cookies: Record<string, string> = {};
+export class McpError extends Error {
+  readonly code: McpErrorCode;
+  readonly hint?: string;
 
-  for (const item of header.split(';')) {
-    const separator = item.indexOf('=');
-
-    if (separator < 0) {
-      continue;
-    }
-
-    const name = item.slice(0, separator).trim();
-    const value = item.slice(separator + 1).trim();
-
-    if (name) {
-      cookies[name] = value;
-    }
+  constructor(code: McpErrorCode, message: string, hint?: string) {
+    super(message);
+    this.name = 'McpError';
+    this.code = code;
+    this.hint = hint;
   }
-
-  return cookies;
 }
 
-function base64UrlEncode(bytes: Uint8Array): string {
-  let binary = '';
+const RISKY_NAME_PATTERN =
+  /(delete|destroy|drop|purge|revoke|truncate|uninstall|reset|overwrite|remove|kill|wipe|erase)/i;
+const READ_NAME_PATTERN =
+  /^(get|list|search|read|fetch|describe|show|inspect|query|lookup|find|retrieve|preview|analyze|analyse|check|status|info|export|download|render|screenshot|view|count|resolve|validate)/i;
+const WRITE_NAME_PATTERN =
+  /(create|update|write|set|put|post|patch|add|insert|push|send|deploy|publish|execute|run|exec|apply|merge|commit|upload|move|rename|copy|transfer|pay|approve|reject|cancel|close|open|start|stop|restart|enable|disable|assign|invite|comment|edit|modify|link|attach|tag|schedule|trigger)/i;
 
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
+/**
+ * Classifies a tool by risk. Conservative by design: a tool that is not clearly
+ * a read-only operation needs the user's per-server opt-in before it runs.
+ */
+export function classifyToolRisk(name: string, description?: string): McpToolRisk {
+  const haystack = `${name} ${description ?? ''}`;
+
+  if (RISKY_NAME_PATTERN.test(name) || RISKY_NAME_PATTERN.test(haystack)) {
+    return 'destructive';
   }
 
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  if (READ_NAME_PATTERN.test(name)) {
+    return 'read';
+  }
+
+  if (WRITE_NAME_PATTERN.test(name) || WRITE_NAME_PATTERN.test(haystack)) {
+    return 'write';
+  }
+
+  return 'write';
 }
 
-function base64UrlDecode(value: string): Uint8Array {
-  const normalized = value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (value.length % 4)) % 4);
-  const binary = atob(normalized);
-  const bytes = new Uint8Array(binary.length);
-
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-
-  return bytes;
+export function toolRequiresApproval(tool: Pick<McpToolInfo, 'risk'>): boolean {
+  return tool.risk !== 'read';
 }
 
-function cookieValue(name: string, value: string, options: CookieOptions = {}): string {
-  const attributes = [`${name}=${encodeURIComponent(value)}`, 'Path=/', 'SameSite=Lax'];
-
-  if (options.maxAge !== undefined) {
-    attributes.push(`Max-Age=${options.maxAge}`);
+function classifyRawMessage(message: string, hasBearerToken: boolean): McpError | undefined {
+  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo|DNS/i.test(message)) {
+    return new McpError('dns', 'MCP server host could not be resolved (DNS failure).', 'Check the server URL.');
   }
 
-  if (options.httpOnly) {
-    attributes.push('HttpOnly');
+  if (/certificate|self-signed|TLS|SSL|ERR_SSL/i.test(message)) {
+    return new McpError('tls', 'TLS handshake with the MCP server failed.', 'The server certificate is not trusted.');
   }
 
-  if (locationProtocolIsSecure()) {
-    attributes.push('Secure');
+  if (/401|unauthori[sz]ed/i.test(message)) {
+    return hasBearerToken
+      ? new McpError(
+          'invalid_bearer_token',
+          'The MCP server rejected the bearer token (HTTP 401).',
+          'Check that the token is valid and not expired, then reconnect the server.',
+        )
+      : new McpError(
+          'oauth_required',
+          'This MCP server requires OAuth authorization before it can be used.',
+          'Use "Connect with OAuth" in Settings → Connection.',
+        );
   }
 
-  return attributes.join('; ');
+  if (/403|forbidden/i.test(message)) {
+    return new McpError(
+      'http_403',
+      'The MCP server refused the request (HTTP 403).',
+      'The credential is valid but lacks the required scope or permission.',
+    );
+  }
+
+  if (/405|not acceptable|unsupported media|content-type/i.test(message)) {
+    return new McpError(
+      'unsupported_transport',
+      'The MCP server does not accept Streamable HTTP at this URL.',
+      'Verify the endpoint URL; the official endpoints end in `/mcp`.',
+    );
+  }
+
+  if (/abort|timed out|timeout/i.test(message)) {
+    return new McpError(
+      'timeout',
+      `MCP request timed out after ${MCP_REQUEST_TIMEOUT_MS / 1000}s.`,
+      'Retry, or check the server status.',
+    );
+  }
+
+  if (/unsupported protocol version|protocol version|initialize/i.test(message)) {
+    return new McpError(
+      'protocol_negotiation_failed',
+      'MCP protocol negotiation failed during initialize.',
+      'The server may implement an incompatible MCP revision.',
+    );
+  }
+
+  if (/fetch failed|network|socket|ECONN/i.test(message)) {
+    return new McpError(
+      'network',
+      'Could not reach the MCP server from the Worker.',
+      'Check network egress and the server URL.',
+    );
+  }
+
+  if (/JSON|parse|Unexpected token|malformed/i.test(message)) {
+    return new McpError(
+      'malformed_response',
+      'The MCP server returned a malformed response.',
+      'The endpoint may not be an MCP server.',
+    );
+  }
+
+  return undefined;
 }
 
-function locationProtocolIsSecure(): boolean {
-  return true;
+/** Maps transport/SDK failures onto stable codes the UI can act on. */
+export function getMcpErrorMessage(error: unknown, phase: 'connect' | 'list' | 'call' = 'connect'): string {
+  return classifyMcpError(error, phase).message;
 }
 
-function safeMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : 'Unknown MCP error';
-
-  if (/unauthorized|401|oauth|authorization required/i.test(message)) {
-    return 'MCP server requires OAuth; v1 supports authless servers and bearer tokens only.';
+export function classifyMcpError(error: unknown, phase: 'connect' | 'list' | 'call' = 'connect'): McpError {
+  if (error instanceof McpError) {
+    return error;
   }
 
-  return message
-    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,}]+/gi, '$1[redacted]')
-    .replace(/(token|secret|api[_ -]?key)\s*[:=]\s*[^\s,}]+/gi, '$1=[redacted]')
-    .slice(0, 600);
+  const record = error !== null && typeof error === 'object' ? (error as Record<string, unknown>) : undefined;
+  const status =
+    typeof record?.code === 'number' ? record.code : typeof record?.status === 'number' ? record.status : undefined;
+  const rawMessage = redactSecrets(
+    error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+        ? error
+        : record?.message
+          ? String(record.message)
+          : 'Unknown MCP error',
+  ).slice(0, 400);
+
+  if (status === 401) {
+    return new McpError(
+      'http_401',
+      'The MCP server answered HTTP 401 (authentication required).',
+      'Connect the server with OAuth or provide a valid bearer token.',
+    );
+  }
+
+  if (status === 403) {
+    return new McpError(
+      'http_403',
+      'The MCP server answered HTTP 403 (forbidden).',
+      'The credential lacks the required scope.',
+    );
+  }
+
+  const fromMessage = classifyRawMessage(rawMessage, false);
+
+  if (fromMessage) {
+    return fromMessage;
+  }
+
+  if (phase === 'list') {
+    return new McpError(
+      'tools_list_failed',
+      `MCP tools/list failed: ${rawMessage}`,
+      'Refresh the connection from Settings → Connection.',
+    );
+  }
+
+  if (phase === 'call') {
+    return new McpError('tools_call_failed', `MCP tools/call failed: ${rawMessage}`);
+  }
+
+  return new McpError('unknown', `MCP connection failed: ${rawMessage}`);
 }
 
-function validateServerUrl(value: string): string {
+export function validateServerUrl(value: string): string {
   let url: URL;
 
   try {
     url = new URL(value);
   } catch {
-    throw new Error('MCP server URL must be a valid http:// or https:// URL');
+    throw new McpError('invalid_request', 'MCP server URL must be a valid http:// or https:// URL');
   }
 
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('MCP server URL must use http:// or https://');
+    throw new McpError('invalid_request', 'MCP server URL must use http:// or https://');
   }
 
   if (url.username || url.password) {
-    throw new Error('MCP server URL must not contain credentials; use the bearer token field');
+    throw new McpError('invalid_request', 'MCP server URL must not contain credentials; use the bearer token field');
   }
 
-  if (/[?&](token|key|secret|auth)=/i.test(url.search)) {
-    throw new Error('MCP bearer credentials must not be placed in the URL query string');
+  if (/[?&](token|key|secret|auth|access_token)=/i.test(url.search)) {
+    throw new McpError('invalid_request', 'MCP credentials must not be placed in the URL query string');
   }
 
   return url.toString();
@@ -143,107 +326,178 @@ function normalizeToolInfo(toolInfo: { name: string; description?: string; input
     toolInfo.inputSchema && typeof toolInfo.inputSchema === 'object' && !Array.isArray(toolInfo.inputSchema)
       ? (toolInfo.inputSchema as Record<string, unknown>)
       : { type: 'object', properties: {} };
+  const description = toolInfo.description?.slice(0, MCP_TOOL_DESCRIPTION_LIMIT);
 
   return {
     name: toolInfo.name.slice(0, 160),
-    description: toolInfo.description?.slice(0, 1000),
+    description,
     inputSchema,
+    risk: classifyToolRisk(toolInfo.name, description),
   };
 }
 
-function getCookieState(request: Request): { servers: McpServerConfig[]; secrets: McpSecretState } {
-  const cookies = parseCookies(request);
+function parseStoredServers(raw: string, trusted: boolean): McpServerConfig[] {
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+
+  if (!Array.isArray(parsed)) {
+    return [];
+  }
+
+  const servers: McpServerConfig[] = [];
+
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+
+    const record = item as Record<string, unknown>;
+
+    if (typeof record.id !== 'string' || typeof record.url !== 'string') {
+      continue;
+    }
+
+    if (!trusted && !/^https?:\/\//i.test(record.url)) {
+      continue;
+    }
+
+    servers.push({
+      id: record.id,
+      name: typeof record.name === 'string' ? record.name.slice(0, 100) : record.id,
+      url: record.url,
+      enabled: record.enabled !== false,
+      authMode: record.authMode === 'bearer' || record.authMode === 'oauth' ? record.authMode : 'authless',
+      status: record.status === 'connected' || record.status === 'auth_required' ? record.status : 'error',
+      statusMessage: typeof record.statusMessage === 'string' ? record.statusMessage.slice(0, 400) : undefined,
+      statusCode: typeof record.statusCode === 'string' ? (record.statusCode as McpErrorCode) : undefined,
+      statusHint: typeof record.statusHint === 'string' ? record.statusHint.slice(0, 400) : undefined,
+      allowRiskyTools: record.allowRiskyTools === true,
+      tools: Array.isArray(record.tools) ? (record.tools as McpToolInfo[]).map(normalizeToolInfo).slice(0, 100) : [],
+      addedAt: typeof record.addedAt === 'string' ? record.addedAt : undefined,
+      lastCheckedAt: typeof record.lastCheckedAt === 'string' ? record.lastCheckedAt : undefined,
+    });
+  }
+
+  return servers;
+}
+
+/**
+ * Reads the full MCP state.
+ *
+ * The public cookie must carry a valid signature when a secret exists; unsigned
+ * cookies (written by the previous implementation) are ignored and reported as
+ * a warning so the user re-adds servers instead of inheriting untrusted state.
+ */
+export async function readMcpState(request: Request, env: SecretEnvironment): Promise<McpState> {
+  const cookies = readRequestCookies(request);
+  const secret = resolveAppSecret(env);
+  const warnings: string[] = [];
   let servers: McpServerConfig[] = [];
 
   if (cookies[MCP_PUBLIC_COOKIE]) {
-    try {
-      const parsed = JSON.parse(decodeURIComponent(cookies[MCP_PUBLIC_COOKIE])) as unknown;
-      servers = Array.isArray(parsed) ? (parsed as McpServerConfig[]) : [];
-    } catch {
-      servers = [];
+    if (secret) {
+      const unsigned = await decodeSignedCookieValue(cookies[MCP_PUBLIC_COOKIE], secret.value);
+
+      if (unsigned) {
+        servers = parseStoredServers(unsigned, true);
+      } else {
+        const legacy = parseStoredServers(cookies[MCP_PUBLIC_COOKIE], false);
+
+        if (legacy.length > 0) {
+          warnings.push(
+            'MCP servers were reset because their configuration could not be verified. Please add them again.',
+          );
+        }
+      }
+    } else {
+      const unsignedServers = parseStoredServers(cookies[MCP_PUBLIC_COOKIE], false);
+
+      if (unsignedServers.length > 0) {
+        warnings.push(
+          'MCP server configuration is unsigned because no Worker secret is configured. Set APP_ENCRYPTION_SECRET and re-add servers to store credentials securely.',
+        );
+        servers = unsignedServers;
+      }
     }
   }
 
-  return { servers, secrets: {} };
-}
-
-async function deriveKey(secret: string): Promise<CryptoKey> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret));
-
-  return crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-}
-
-async function encryptSecrets(secrets: McpSecretState, secret: string): Promise<string> {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveKey(secret);
-  const plaintext = new TextEncoder().encode(JSON.stringify(secrets));
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
-  const packed = new Uint8Array(iv.byteLength + ciphertext.byteLength);
-  packed.set(iv);
-  packed.set(new Uint8Array(ciphertext), iv.byteLength);
-
-  return base64UrlEncode(packed);
-}
-
-async function decryptSecrets(value: string, secret: string): Promise<McpSecretState> {
-  try {
-    const packed = base64UrlDecode(value);
-    const iv = packed.slice(0, 12);
-    const ciphertext = packed.slice(12);
-    const key = await deriveKey(secret);
-    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
-    const parsed = JSON.parse(new TextDecoder().decode(plaintext)) as unknown;
-
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as McpSecretState) : {};
-  } catch {
-    throw new Error('MCP token storage could not be decrypted; set MCP_COOKIE_SECRET and reconnect the server');
-  }
-}
-
-export async function readMcpState(
-  request: Request,
-  env: Env,
-): Promise<{ servers: McpServerConfig[]; secrets: McpSecretState }> {
-  const state = getCookieState(request);
-  const cookies = parseCookies(request);
+  let secrets: McpSecretState = {};
 
   if (cookies[MCP_SECRET_COOKIE]) {
-    if (!env.MCP_COOKIE_SECRET) {
-      if (state.servers.some((server) => server.enabled)) {
-        throw new Error('MCP_COOKIE_SECRET is required to read stored MCP bearer tokens');
+    if (!secret) {
+      if (servers.some((server) => server.enabled)) {
+        warnings.push(
+          'Stored MCP credentials cannot be read: set APP_ENCRYPTION_SECRET (or MCP_COOKIE_SECRET) as a Worker secret.',
+        );
       }
+    } else {
+      const decrypted = await openJsonPayload<McpSecretState>(cookies[MCP_SECRET_COOKIE], secret.value);
 
-      return state;
+      if (decrypted && typeof decrypted === 'object' && !Array.isArray(decrypted)) {
+        secrets = decrypted;
+      } else {
+        warnings.push(
+          'Stored MCP credentials could not be decrypted and were dropped. Reconnect the affected servers.',
+        );
+      }
     }
-
-    state.secrets = await decryptSecrets(cookies[MCP_SECRET_COOKIE], env.MCP_COOKIE_SECRET);
   }
 
-  return state;
+  const oauth = await readOAuthStore(request, env);
+
+  return { servers, secrets, oauth, warnings };
 }
 
-export async function mcpStateHeaders(servers: McpServerConfig[], secrets: McpSecretState, env: Env): Promise<Headers> {
+/** Set-Cookie headers that persist MCP state (optionally with fresh OAuth state). */
+export async function mcpStateHeaders(
+  servers: McpServerConfig[],
+  secrets: McpSecretState,
+  env: SecretEnvironment,
+  oauth?: McpOAuthStore,
+): Promise<string[]> {
   const publicValue = JSON.stringify(servers);
+  const headers: string[] = [];
 
   if (new TextEncoder().encode(publicValue).byteLength > MCP_MAX_PUBLIC_COOKIE_BYTES) {
-    throw new Error('MCP configuration is too large for cookie storage; remove unused servers or tools');
+    throw new McpError(
+      'invalid_request',
+      'MCP configuration is too large for cookie storage; remove unused servers or refresh their tool lists.',
+    );
   }
 
-  if (Object.keys(secrets).length > 0 && !env.MCP_COOKIE_SECRET) {
-    throw new Error('Set MCP_COOKIE_SECRET in Worker secrets before saving an MCP bearer token');
-  }
+  const secret = resolveAppSecret(env);
 
-  const headers = new Headers();
-  headers.append('Set-Cookie', cookieValue(MCP_PUBLIC_COOKIE, publicValue, { maxAge: MCP_COOKIE_MAX_AGE }));
-
-  if (Object.keys(secrets).length > 0 && env.MCP_COOKIE_SECRET) {
-    const encrypted = await encryptSecrets(secrets, env.MCP_COOKIE_SECRET);
-    headers.append(
-      'Set-Cookie',
-      cookieValue(MCP_SECRET_COOKIE, encrypted, { httpOnly: true, maxAge: MCP_COOKIE_MAX_AGE }),
+  if (secret) {
+    headers.push(
+      serializeCookie(MCP_PUBLIC_COOKIE, await encodeSignedCookieValue(publicValue, secret.value), {
+        maxAge: MCP_COOKIE_MAX_AGE,
+      }),
     );
   } else {
-    headers.append('Set-Cookie', cookieValue(MCP_SECRET_COOKIE, '', { httpOnly: true, maxAge: 0 }));
+    headers.push(serializeCookie(MCP_PUBLIC_COOKIE, publicValue, { maxAge: MCP_COOKIE_MAX_AGE }));
+  }
+
+  if (Object.keys(secrets).length > 0) {
+    const sealed = await sealJsonPayload(secrets, requireOAuthSecret(env));
+
+    headers.push(
+      serializeCookie(MCP_SECRET_COOKIE, sealed, {
+        httpOnly: true,
+        maxAge: MCP_COOKIE_MAX_AGE,
+        sameSite: 'Lax',
+      }),
+    );
+  } else {
+    headers.push(clearCookie(MCP_SECRET_COOKIE, { httpOnly: true }));
+  }
+
+  if (oauth) {
+    headers.push(...(await oauthStoreHeaders(oauth, env)));
   }
 
   return headers;
@@ -256,18 +510,58 @@ function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, message:
   return operation(controller.signal).finally(() => clearTimeout(timeout));
 }
 
+export type McpClientContext = {
+  serverId: string;
+  env: SecretEnvironment;
+  bearerToken?: string;
+  oauth?: {
+    store: McpOAuthStore;
+    redirectUrl: string;
+    clientMetadataUrl?: string;
+  };
+};
+
+function transportRedirectUrl(request?: Request): string {
+  return `${request ? getRequestOrigin(request) : 'http://localhost'}/api/mcp/oauth/callback`;
+}
+
+export function createMcpClientContext(options: {
+  request?: Request;
+  env: SecretEnvironment;
+  serverId: string;
+  bearerToken?: string;
+  oauthStore?: McpOAuthStore;
+  clientMetadataUrl?: string;
+}): McpClientContext {
+  const context: McpClientContext = {
+    serverId: options.serverId,
+    env: options.env,
+    bearerToken: options.bearerToken,
+  };
+
+  if (options.oauthStore && isMcpOAuthConfigured(options.env)) {
+    context.oauth = {
+      store: options.oauthStore,
+      redirectUrl: transportRedirectUrl(options.request),
+      clientMetadataUrl: options.clientMetadataUrl,
+    };
+  }
+
+  return context;
+}
+
 async function withMcpClient<T>(
   server: McpServerConfig,
-  bearerToken: string | undefined,
+  context: McpClientContext,
   operation: (client: Client) => Promise<T>,
 ): Promise<T> {
   const headers: Record<string, string> = {};
 
-  if (bearerToken) {
-    headers.Authorization = `Bearer ${bearerToken}`;
+  if (context.bearerToken) {
+    headers.Authorization = `Bearer ${context.bearerToken}`;
   }
 
-  const transport = new StreamableHTTPClientTransport(new URL(server.url), {
+  const transportOptions: ConstructorParameters<typeof StreamableHTTPClientTransport>[1] = {
     requestInit: { headers },
     reconnectionOptions: {
       initialReconnectionDelay: 100,
@@ -275,7 +569,19 @@ async function withMcpClient<T>(
       reconnectionDelayGrowFactor: 1,
       maxRetries: 0,
     },
-  });
+  };
+
+  if (context.oauth) {
+    transportOptions.authProvider = transportAuthProvider({
+      store: context.oauth.store,
+      serverId: context.serverId,
+      serverUrl: server.url,
+      redirectUrl: context.oauth.redirectUrl,
+      clientMetadataUrl: context.oauth.clientMetadataUrl,
+    });
+  }
+
+  const transport = new StreamableHTTPClientTransport(new URL(server.url), transportOptions);
   const client = new Client({ name: 'bolt-replit', version: '0.0.3' });
 
   try {
@@ -283,25 +589,44 @@ async function withMcpClient<T>(
       (signal) => client.connect(transport, { signal, timeout: MCP_REQUEST_TIMEOUT_MS }),
       'MCP initialize timed out',
     );
+
     return await operation(client);
   } finally {
     await client.close().catch(() => undefined);
   }
 }
 
-export async function discoverMcpTools(server: McpServerConfig, bearerToken?: string): Promise<McpToolInfo[]> {
-  return withMcpClient(server, bearerToken, async (client) => {
-    const result = await withTimeout(
-      (signal) => client.listTools(undefined, { signal, timeout: MCP_REQUEST_TIMEOUT_MS }),
-      'MCP tools/list timed out',
-    );
+export async function discoverMcpTools(
+  server: McpServerConfig,
+  context: McpClientContext,
+  phase: 'connect' | 'list' = 'connect',
+): Promise<McpToolInfo[]> {
+  try {
+    return await withMcpClient(server, context, async (client) => {
+      const result = await withTimeout(
+        (signal) => client.listTools(undefined, { signal, timeout: MCP_REQUEST_TIMEOUT_MS }),
+        'MCP tools/list timed out',
+      );
 
-    return result.tools.map(normalizeToolInfo);
-  });
+      return result.tools.map(normalizeToolInfo);
+    });
+  } catch (error) {
+    throw classifyMcpError(error, phase);
+  }
 }
 
 function stringifyToolOutput(value: unknown): string {
-  const result = typeof value === 'string' ? value : JSON.stringify(value);
+  let result: string;
+
+  try {
+    result = typeof value === 'string' ? value : JSON.stringify(value);
+  } catch {
+    result = '[MCP tool returned a value that could not be serialized]';
+  }
+
+  if (result === undefined) {
+    result = 'undefined';
+  }
 
   if (new TextEncoder().encode(result).byteLength <= MCP_MAX_TOOL_OUTPUT) {
     return result;
@@ -310,18 +635,43 @@ function stringifyToolOutput(value: unknown): string {
   return `[MCP tool output exceeded the ${MCP_MAX_TOOL_OUTPUT}-byte limit and was truncated]`;
 }
 
+export type McpToolCallOutcome = {
+  server: string;
+  tool: string;
+  risk: McpToolRisk;
+  outcome: 'ok' | 'error' | 'denied';
+  durationMs: number;
+  result: string;
+};
+
+/** Executes a tool with server-side risk gating and audit-safe metadata. */
 export async function callMcpTool(
   server: McpServerConfig,
-  bearerToken: string | undefined,
+  context: McpClientContext,
   toolName: string,
   args: unknown,
 ): Promise<string> {
-  if (!server.tools.some((toolInfo) => toolInfo.name === toolName)) {
-    return `MCP tool ${toolName} is not in the discovered tool list for ${server.name}`;
+  const toolInfo = server.tools.find((item) => item.name === toolName);
+
+  if (!toolInfo) {
+    return `MCP tool ${toolName} is not in the discovered tool list for ${server.name}. Refresh the connection in Settings → Connection.`;
   }
 
+  const risk = toolInfo.risk;
+
+  if (toolRequiresApproval(toolInfo) && server.allowRiskyTools !== true) {
+    auditMcpToolCall({ server: server.name, tool: toolName, risk, outcome: 'denied', durationMs: 0 });
+
+    return (
+      `MCP tool ${toolName} on ${server.name} was NOT executed: it is classified as "${risk}" and this server has not ` +
+      'been granted permission for write/destructive tools. Ask the user to enable "Allow write tools" for this server in Settings → Connection.'
+    );
+  }
+
+  const startedAt = Date.now();
+
   try {
-    const result = await withMcpClient(server, bearerToken, (client) =>
+    const result = await withMcpClient(server, context, (client) =>
       withTimeout(
         (signal) =>
           client.callTool({ name: toolName, arguments: (args ?? {}) as Record<string, unknown> }, undefined, {
@@ -332,26 +682,95 @@ export async function callMcpTool(
       ),
     );
 
+    auditMcpToolCall({ server: server.name, tool: toolName, risk, outcome: 'ok', durationMs: Date.now() - startedAt });
+
     if ('isError' in result && result.isError) {
       return `MCP tool ${toolName} returned an error: ${stringifyToolOutput(result.content)}`;
     }
 
     return stringifyToolOutput(result);
   } catch (error) {
-    return `MCP tool ${toolName} failed on ${server.name}: ${safeMessage(error)}`;
+    const classified = classifyMcpError(error, 'call');
+
+    auditMcpToolCall({
+      server: server.name,
+      tool: toolName,
+      risk,
+      outcome: 'error',
+      durationMs: Date.now() - startedAt,
+    });
+
+    return `MCP tool ${toolName} failed on ${server.name} [${classified.code}]: ${classified.message}`;
   }
+}
+
+/**
+ * Audit trail for tool execution. Server name, tool name, risk level, outcome
+ * and duration only - never arguments, results or credentials.
+ */
+function auditMcpToolCall(entry: {
+  server: string;
+  tool: string;
+  risk: McpToolRisk;
+  outcome: 'ok' | 'error' | 'denied';
+  durationMs: number;
+}): void {
+  console.log(
+    `[mcp] tool_call ${JSON.stringify({
+      server: entry.server.slice(0, 100),
+      tool: entry.tool.slice(0, 100),
+      risk: entry.risk,
+      outcome: entry.outcome,
+      durationMs: entry.durationMs,
+    })}`,
+  );
 }
 
 function toolNamePart(value: string): string {
   return value.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40) || 'server';
 }
 
-export async function getMcpTools(request: Request, env: Env): Promise<Record<string, CoreTool>> {
-  const { servers, secrets } = await readMcpState(request, env);
+/**
+ * Builds the AI SDK tool map for a chat request.
+ *
+ * When no MCP server is enabled this returns `{}` and `streamText` keeps its
+ * previous code path exactly (no tools, no maxSteps).
+ */
+export async function getMcpTools(
+  request: Request,
+  env: SecretEnvironment,
+  options: { clientMetadataUrl?: string } = {},
+): Promise<Record<string, CoreTool>> {
+  const clientMetadataUrl = options.clientMetadataUrl ?? mcpClientMetadataUrl(request);
+  let state: McpState;
+
+  try {
+    state = await readMcpState(request, env);
+  } catch (error) {
+    console.error(`[mcp] state unavailable: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);
+
+    return {};
+  }
+
+  const enabled = state.servers.filter((server) => server.enabled && server.tools.length > 0);
+
+  if (enabled.length === 0) {
+    return {};
+  }
+
   const tools: Record<string, CoreTool> = {};
   const usedNames = new Set<string>();
 
-  for (const server of servers.filter((item) => item.enabled && item.tools.length > 0)) {
+  for (const server of enabled) {
+    const context = createMcpClientContext({
+      request,
+      env,
+      serverId: server.id,
+      bearerToken: state.secrets[server.id],
+      oauthStore: state.oauth,
+      clientMetadataUrl,
+    });
+
     for (const toolInfo of server.tools) {
       const baseName = `mcp_${toolNamePart(server.name)}_${toolNamePart(toolInfo.name)}`;
       let name = baseName;
@@ -363,13 +782,18 @@ export async function getMcpTools(request: Request, env: Env): Promise<Record<st
       }
 
       usedNames.add(name);
+
       tools[name] = tool({
-        description: `[MCP server: ${server.name}] ${toolInfo.description ?? toolInfo.name}`,
+        description:
+          `[MCP server: ${server.name} | risk: ${toolInfo.risk}` +
+          `${toolRequiresApproval(toolInfo) && server.allowRiskyTools !== true ? ' | requires user approval' : ''}] ` +
+          (toolInfo.description ?? toolInfo.name),
         parameters: jsonSchema(toolInfo.inputSchema),
         execute: async (args) => ({
           server: server.name,
           tool: toolInfo.name,
-          result: await callMcpTool(server, secrets[server.id], toolInfo.name, args),
+          risk: toolInfo.risk,
+          result: await callMcpTool(server, context, toolInfo.name, args),
         }),
       });
     }
@@ -378,8 +802,73 @@ export async function getMcpTools(request: Request, env: Env): Promise<Record<st
   return tools;
 }
 
-export function publicMcpServer(server: McpServerConfig): Omit<McpServerConfig, never> {
+/** Absolute URL of the OAuth client-metadata document for this deployment. */
+export function mcpClientMetadataUrl(request: Request): string | undefined {
+  if (!isSecureOrigin(request)) {
+    return undefined;
+  }
+
+  return `${getRequestOrigin(request)}/api/mcp/oauth/client-metadata`;
+}
+
+/**
+ * Discovers tools for one server and records the outcome on the entry.
+ * Never throws: failures become a status the UI can explain precisely.
+ */
+export async function refreshServerStatus(
+  server: McpServerConfig,
+  state: McpState,
+  env: SecretEnvironment,
+  request: Request,
+): Promise<McpServerConfig> {
+  const context = createMcpClientContext({
+    request,
+    env,
+    serverId: server.id,
+    bearerToken: state.secrets[server.id],
+    oauthStore: state.oauth,
+    clientMetadataUrl: mcpClientMetadataUrl(request),
+  });
+
+  try {
+    const tools = await discoverMcpTools(server, context);
+
+    return {
+      ...server,
+      tools,
+      status: 'connected',
+      statusMessage: undefined,
+      statusCode: undefined,
+      statusHint: undefined,
+      lastCheckedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    const classified = classifyMcpError(error);
+    const authRequired = classified.code === 'oauth_required' || classified.code === 'http_401';
+
+    return {
+      ...server,
+      authMode: authRequired ? 'oauth' : server.authMode,
+      status: authRequired ? 'auth_required' : 'error',
+      ...mcpStatusFields(classified),
+      lastCheckedAt: new Date().toISOString(),
+    };
+  }
+}
+
+export function publicMcpServer(server: McpServerConfig): McpServerConfig {
   return server;
 }
 
-export { safeMessage as getMcpErrorMessage, validateServerUrl };
+/** Status message + hint for a classification, safe for the UI. */
+export function mcpStatusFields(error: McpError): {
+  statusMessage: string;
+  statusCode: McpErrorCode;
+  statusHint?: string;
+} {
+  return {
+    statusMessage: error.message,
+    statusCode: error.code,
+    statusHint: error.hint,
+  };
+}

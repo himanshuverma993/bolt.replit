@@ -14,6 +14,12 @@ binding = "AI"
 # Workers AI is a remote-only binding during local development.
 remote = true
 
+# Runtime secrets (never commit values; set them with `wrangler secret put`):
+#   APP_ENCRYPTION_SECRET   seals GitHub/MCP credentials (AES-256-GCM) and signs
+#                           MCP server configuration. GITHUB_COOKIE_SECRET and
+#                           MCP_COOKIE_SECRET are accepted as fallbacks.
+# GitHub and MCP features refuse to store credentials until one of these exists.
+
 [assets]
 directory = "./build/client"
 binding = "ASSETS"
