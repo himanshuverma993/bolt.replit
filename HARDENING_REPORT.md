@@ -765,6 +765,30 @@ DRYRUN_EXIT=0    (wrangler deploy --dry-run 31s; bindings env.AI, env.ASSETS)
 | `env.AI` missing at runtime | `cloudflare.ts` throws *"Cloudflare Workers AI binding is unavailable. Add `[ai] binding = \"AI\"` to wrangler.toml and deploy the Worker with Workers AI enabled."* before any inference is attempted | `cloudflare.spec.ts` |
 | Cloudflare model list on the live deployment | `GET /api/models` returns both ids with `provider: "Cloudflare"` and `maxTokenAllowed: 4096`. Note what this endpoint does **and does not** carry: it is a flat `{name,label,provider,maxTokenAllowed}` list, so `requiresApiKey` is not part of it - the keyless behaviour comes from the provider instance (`BaseChat` passes `PROVIDER_LIST`, i.e. the provider objects, to `APIKeyManager`), which is pinned by `app/components/chat/APIKeyManager.spec.ts` and by the live inference step that reaches `env.AI.run` with no key | live probe (fetched just now) + live-verification steps 9/12 |
 
+### 12.3b The workerd smoke test now covers four flows (was one)
+
+`scripts/ci/workers-runtime-smoke.mjs` boots the built Worker in local workerd (no Cloudflare account) with a
+mock MCP server and `APP_ENCRYPTION_SECRET`, and no `[ai]` binding. It used to assert one flow; it now asserts
+four, each of which is only reachable in the real runtime:
+
+| Check | What it proves | Output |
+| --- | --- | --- |
+| Authless MCP connect | the Ajv-codegen regression guard (tool with an `outputSchema`) | `status=connected tools=get_page` |
+| Bearer MCP server + cookie read-back | the token really reached the server (the mock answers 401 otherwise), the response did not echo it, an `HttpOnly` `mcpSecrets` cookie holds a **sealed** value, and `GET /api/mcp` with that cookie reads the server back - i.e. the AES-GCM seal/open round trip works in workerd, not just on Node | `POST /api/mcp (bearer) -> 200 status=connected`, `bearer tools: get_secure_page`, `credential seal/open inside workerd works` |
+| GitHub session handling | an unreadable `gh_session` cookie is reported as `connected=false, reason=unreadable` instead of crashing | `GET /api/github (unreadable session) -> 200 reason=unreadable` |
+| Cloudflare without `env.AI` | the user-facing error is explicit and actionable and does not ask for an API key | `POST /api/chat (Cloudflare, no [ai] binding) -> 200 bytes=140`, `missing Workers AI binding produces an explicit, actionable error inside workerd` |
+
+Teeth check: pointing the bearer server at a URL that does not require the token makes the run exit 1 with
+`the bearer-protected tool was not discovered (the token did not reach the server)`.
+
+One environment quirk was found and documented in the script: `wrangler dev` answers a **gzip-negotiated**
+streaming response with an empty body (curl, which does not negotiate gzip, receives the real 140 bytes), so
+the smoke requests ask for `Accept-Encoding: identity`. Without that, the fourth check would have "failed" for
+a reason that has nothing to do with the Worker.
+
+Still unverified in workerd: an actual `tools/call` execution (tools are only invoked from the chat route, which
+needs `env.AI`; the unit suite covers the call path, the output cap and the destructive-tool gate on Node).
+
 ### 12.4 Commits and live runs of this pass
 
 | Commit | Subject |
