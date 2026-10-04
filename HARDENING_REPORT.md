@@ -774,12 +774,13 @@ server (authless) to a cookie jar, then posts a chat that must answer `TOOLS_OK`
 an MCP or Workers AI error. It is the only check that exercises `env.AI` **and** the MCP tool wiring **and** a
 real remote server in one request - a combination nothing else covers.
 
-Because the deployed production build predates this branch, the step first classifies production's MCP state;
-if the tool path is not usable there it emits a notice naming the state and exits 0, so the assertion activates
-by itself once this branch is merged to `main`. Its snippets were behaviour-tested with canned data: a
-`connected` server with tools -> `connected`; the pre-fix `Code generation from strings disallowed` refusal ->
-`not_connected`; a chat stream containing `TOOLS_OK` -> exit 0, one without it -> exit 2. All 14 `run:` blocks
-pass `bash -n` and the YAML parses.
+Because the deployed production build predates this branch, the step is strict only when the workflow's own
+target is production; a branch run reports the same failure as a notice naming the state
+(`stop()` in the step), so the assertion activates by itself once this branch is merged to `main`. Its snippets
+were behaviour-tested with canned data: a `connected` server with tools -> `connected`; the pre-fix
+`Code generation from strings disallowed` refusal -> `not_connected`; an `auth_required`/`http_401` server ->
+`not_connected`; a chat stream containing `TOOLS_OK` -> `connected`, one without it -> `no_answer`. All 14
+`run:` blocks pass `bash -n` and the YAML parses.
 
 ### 12.3b The workerd smoke test now covers six flows (was one)
 

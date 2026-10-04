@@ -277,20 +277,42 @@ jobs:
           if [ "$fail" != "0" ]; then exit 1; fi
           echo "::notice::both Cloudflare Workers AI model ids answered through the production deployment without an API key"
 
-      - name: Tools-enabled chat with a real MCP server (production only, needs env.AI)
-        if: ${{ steps.target.outputs.is_production == 'true' }}
+      - name: Tools-enabled chat with a real MCP server (Workers AI + MCP tool wiring)
+        env:
+          RESOLVED_BASE: ${{ steps.target.outputs.base }}
+          IS_PRODUCTION: ${{ steps.target.outputs.is_production }}
         run: |
           set -uo pipefail
-          BASE="${{ steps.target.outputs.base }}"
-          # The branch preview has no env.AI binding, so this can only be asserted
-          # on production. Adding the server only writes a cookie jar in the
-          # runner; nothing is stored on the deployment.
+          # The branch preview has no env.AI binding, so this probe always targets
+          # the production deployment (like the model-id step above). Adding the
+          # server only writes a cookie jar in the runner; nothing is stored on
+          # the deployment. Failures are fatal only on the production target - a
+          # branch run reports them as notices, because production still runs the
+          # merged build, not this branch.
+          if [ "$IS_PRODUCTION" = "true" ]; then
+            BASE="$RESOLVED_BASE"
+            STRICT=1
+          else
+            BASE="https://bolt-replit.biharzone37.workers.dev"
+            STRICT=0
+          fi
+          stop() {
+            if [ "$STRICT" = "1" ]; then
+              echo "::error::$1"
+              exit 1
+            fi
+            echo "::notice::$1 (production is not this branch's build; the assertion activates after merge)"
+            exit 0
+          }
+          echo "probing $BASE"
           rm -f /tmp/tools.jar
           code=$(curl -sS --max-time 60 -o /tmp/mcp-tools.json -w '%{http_code}' -X POST "$BASE/api/mcp" \
             -H 'Content-Type: application/json' -H "Origin: $BASE" -c /tmp/tools.jar \
             --data '{"action":"add","name":"cf-docs-tools","url":"https://docs.mcp.cloudflare.com/mcp"}') || code=000
           echo "POST /api/mcp (authless server for the tools chat probe) -> $code"
-          [ "$code" = "200" ] || { echo "::error::adding an authless MCP server on production returned HTTP $code"; exit 1; }
+          if [ "$code" != "200" ]; then
+            stop "the production MCP endpoint did not accept an authless server (HTTP $code)"
+          fi
           node -e '
             const fs = require("fs");
             const body = JSON.parse(fs.readFileSync("/tmp/mcp-tools.json", "utf8"));
@@ -306,17 +328,17 @@ jobs:
           '
           state=$(cat /tmp/tools.state 2>/dev/null || echo unknown)
           if [ "$state" != "connected" ]; then
-            echo "::notice::the production MCP tool path is not usable from the deployed build yet ($state); the tools-enabled chat assertion activates once this branch is merged to main"
-            exit 0
+            stop "the production MCP tool path is not usable from the deployed build ($state)"
           fi
           payload=$(node -e 'process.stdout.write(JSON.stringify({messages:[{role:"user",content:"[Model: @cf/meta/llama-3.1-8b-instruct-fp8]\n\n[Provider: Cloudflare]\n\nReply with exactly: TOOLS_OK"}],files:{}}))')
           code=$(curl -sS --max-time 180 -o /tmp/chat-tools.out -w '%{http_code}' -X POST "$BASE/api/chat" \
             -H 'Content-Type: application/json' -b /tmp/tools.jar --data-binary "$payload") || code=000
           echo "POST /api/chat (MCP tools enabled) -> $code"
-          [ "$code" = "200" ] || { echo "::error::the tools-enabled chat returned HTTP $code :: $(head -c 300 /tmp/chat-tools.out | tr -d '\r' | tr '\n' '|')"; exit 1; }
+          if [ "$code" != "200" ]; then
+            stop "the tools-enabled chat returned HTTP $code :: $(head -c 200 /tmp/chat-tools.out | tr -d '\r' | tr '\n' '|')"
+          fi
           if grep -qiE 'MCP (connection|tool) .*(failed|error)|binding is unavailable' /tmp/chat-tools.out; then
-            echo "::error::the tools-enabled chat reported an MCP or Workers AI failure :: $(head -c 300 /tmp/chat-tools.out | tr -d '\r' | tr '\n' '|')"
-            exit 1
+            stop "the tools-enabled chat reported an MCP or Workers AI failure :: $(head -c 200 /tmp/chat-tools.out | tr -d '\r' | tr '\n' '|')"
           fi
           node -e '
             const fs = require("fs");
@@ -328,11 +350,15 @@ jobs:
               try { const parsed = JSON.parse(line.slice(i + 1)); if (typeof parsed === "string") text += parsed; } catch {}
             }
             if (!text.toLowerCase().includes("tools_ok")) {
-              console.log(`::error::the tools-enabled chat did not answer with TOOLS_OK :: ${text.slice(0, 200)}`);
-              process.exit(2);
+              fs.writeFileSync("/tmp/tools.state", "no_answer");
+              console.log(`the tools-enabled chat did not answer with TOOLS_OK :: ${text.slice(0, 200)}`);
+              process.exit(0);
             }
             console.log(`tools-enabled chat answered: ${text.trim().slice(0, 60)}`);
           '
+          if [ "$(cat /tmp/tools.state 2>/dev/null)" = "no_answer" ]; then
+            stop "the tools-enabled chat did not answer with TOOLS_OK"
+          fi
           echo "::notice::production runs a tools-enabled chat with a real remote MCP server and Workers AI"
 
       - name: Deployed bundle embeds the deployed commit (staleness check)
