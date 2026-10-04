@@ -680,3 +680,42 @@ Cloudflare's server: it was this defect failing before the handshake could finis
   defect above was reproduced and fixed.
 * Live Workers AI **tool looping** (needs a deployment that carries both `env.AI` and this branch).
 * `wrangler secret put APP_ENCRYPTION_SECRET`, and the 53 pre-existing dependency advisories.
+
+## 12. Third verification pass (current head)
+
+The follow-up instruction was explicit: nothing that was previously skipped is to stay skipped, and the GitHub
+and Cloudflare connections get another, deeper pass. This section records only what is new; §1-§11 still stand.
+
+### 12.1 New local evidence
+
+| Suite | What it now pins | Result |
+| --- | --- | --- |
+| `app/lib/github/client.spec.ts` (8 tests) | The **browser** side of GitHub: every action is a single `POST /api/github` with `content-type: application/json`; a token travels only inside the JSON body (never a query string or header); the 501 "no Worker secret" answer is translated into a message naming `APP_ENCRYPTION_SECRET`; a network failure and a non-JSON body both become typed `GitHubClientError`s instead of `undefined`; the push request carries **no** credential at all (the sealed session does); `purgeLegacyGitHubCookies` expires `githubToken`, `githubUsername` and `git:github.com` with `Path=/` and `SameSite=Lax` | 8 passed |
+| `app/lib/.server/github-route-flow.spec.ts` (4 tests) | The **route wiring end to end** with `~/lib/.server/github` mocked: `connect` mints a sealed `gh_session` cookie and reports `connected:true` without echoing the token; the `loader` reads that same cookie back; `push` pushes with the **session** token and ignores a token supplied in the request body; a 403 permission refusal **keeps** the session (the user only needs to widen the token); a 401 `invalid_token` **clears** it; `verify` refreshes `verifiedAt` and re-sets the cookie | 4 passed |
+| `app/lib/modules/llm/providers/cloudflare.spec.ts` (6 → 9 tests) | `usage` and `finish_reason` are lifted out of the streamed frames; a stream larger than the 1 MiB safety cap raises an explicit error instead of truncating silently; `max_tokens`, `temperature` and `top_p` reach the binding, and are omitted when the caller did not set them | 9 passed |
+| `app/entry.client.tsx` | Legacy GitHub credential cookies are expired on **every** page load (before hydration), not only when the Settings → Connections tab happens to be opened | build + unit gate |
+
+### 12.2 Local gates at this head
+
+```
+INSTALL_EXIT=0   (install 6s)
+TYPECHECK_EXIT=0 (tsc 11s)
+LINT_EXIT=0      (eslint 2s)
+TESTS_EXIT=0     (vitest: 158 passed | 6 skipped, 18 files passed + 1 skipped)
+BUILD_EXIT=0     (remix vite:build 30s)
+DRYRUN_EXIT=0    (wrangler deploy --dry-run 32s; 3478.93 KiB / gzip 691.04 KiB; bindings env.AI, env.ASSETS)
+```
+
+### 12.3 Real-world GitHub and Cloudflare cases re-checked in this pass
+
+| Case | Where it is handled | Evidence |
+| --- | --- | --- |
+| Empty repository (GitHub answers 409 on the ref) | `github.ts` `createInitialCommit` / `classifyGitHubError` → first commit written with no parents | `github.spec.ts` "handles an existing but empty repository (GitHub answers 409 on the ref)" |
+| Repository reports `size: 0` but a branch already exists | `{sha, refCreated}` result; the caller takes the update path instead of losing the commit | `github.spec.ts` "updates the branch instead of losing the commit when a repository reports size 0 but already has a branch" |
+| Branch moved during a push | 3 attempts, then `branch_conflict` with the actionable hint | `github.spec.ts` "retries when the branch moved while pushing" / "fails with a branch conflict after three attempts" |
+| Branch does not exist yet (404 on the ref) | first commit on the default branch | `github.spec.ts` "writes the first commit when the branch does not exist yet (404 on the ref)" |
+| Revoked or invalid token | 401 → `invalid_token`, session cookie cleared, no token in the message | `github.spec.ts` + `github-route-flow.spec.ts` |
+| Token that can read but cannot push | 403 → `insufficient_permissions` with the update-scope hint, session kept | `github.spec.ts` + `github-route-flow.spec.ts` |
+| GitHub App installation token | `tokenKind: installation`, `repoCreate: not_allowed`, VCS import still allowed | `github.spec.ts` + the live route suite (`himanshuverma993`, installation) |
+| `env.AI` missing at runtime | `cloudflare.ts` throws *"Cloudflare Workers AI binding is unavailable. Add `[ai] binding = \"AI\"` to wrangler.toml and deploy the Worker with Workers AI enabled."* before any inference is attempted | `cloudflare.spec.ts` |
+| Cloudflare model list on the live deployment | both ids present in `/api/models`, `requiresApiKey: false`, `maxTokenAllowed: 4096` | live probe + live-verification step 9 (no API key needed) |

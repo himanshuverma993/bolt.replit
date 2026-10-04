@@ -215,6 +215,85 @@ describe('CloudflareProvider', () => {
     expect(capturedInput).not.toHaveProperty('tools');
   });
 
+  it('reports token usage from the stream and keeps the finish reason', async () => {
+    const provider = new CloudflareProvider();
+    const response = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode('data: {"response":"hi","usage":{"prompt_tokens":7,"completion_tokens":2}}\n'),
+        );
+        controller.enqueue(
+          new TextEncoder().encode('data: {"response":" there","usage":{"prompt_tokens":7,"completion_tokens":5}}\n'),
+        );
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n'));
+        controller.close();
+      },
+    });
+    const model = provider.getModelInstance({
+      model: provider.staticModels[0].name,
+      serverEnv: { AI: { run: async () => response } } as unknown as Env,
+    });
+
+    const parts = await readStream((await model.doStream(makeOptions())).stream);
+    const finish = parts.at(-1) as { type: string; finishReason: string; usage: Record<string, number> };
+
+    expect(parts.slice(0, 2)).toEqual([
+      { type: 'text-delta', textDelta: 'hi' },
+      { type: 'text-delta', textDelta: ' there' },
+    ]);
+    expect(finish.type).toBe('finish');
+    expect(finish.finishReason).toBe('stop');
+
+    // The latest usage frame wins, so the final counts are the totals.
+    expect(finish.usage).toEqual({ promptTokens: 7, completionTokens: 5 });
+  });
+
+  it('fails the stream with a clear error when Workers AI sends more than 1 MiB', async () => {
+    const provider = new CloudflareProvider();
+    const chunk = new TextEncoder().encode('x'.repeat(600 * 1024));
+    const response = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(chunk);
+        controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const model = provider.getModelInstance({
+      model: provider.staticModels[0].name,
+      serverEnv: { AI: { run: async () => response } } as unknown as Env,
+    });
+
+    const parts = await readStream((await model.doStream(makeOptions())).stream);
+    const failure = parts.at(-1) as { type: string; error: Error };
+
+    expect(parts).toHaveLength(1);
+    expect(failure.type).toBe('error');
+    expect(failure.error.message).toMatch(/1 MiB safety limit/);
+  });
+
+  it('passes sampling settings through and omits them when unset', async () => {
+    const provider = new CloudflareProvider();
+    const captured: Array<Record<string, unknown>> = [];
+    const run = async (_model: string, input: Record<string, unknown>) => {
+      captured.push(input);
+
+      return { response: 'ok' };
+    };
+    const model = provider.getModelInstance({
+      model: provider.staticModels[0].name,
+      serverEnv: { AI: { run } } as unknown as Env,
+    });
+
+    await model.doGenerate(makeOptions({ maxTokens: 512, temperature: 0.2, topP: 0.9 }));
+    expect(captured[0]).toMatchObject({ max_tokens: 512, temperature: 0.2, top_p: 0.9, stream: false });
+
+    await model.doGenerate(makeOptions());
+    expect(captured[1]).toMatchObject({ stream: false });
+    expect(captured[1]).not.toHaveProperty('max_tokens');
+    expect(captured[1]).not.toHaveProperty('temperature');
+    expect(captured[1]).not.toHaveProperty('top_p');
+  });
+
   it('exposes the v1 model contract', () => {
     const provider = new CloudflareProvider();
     const model: LanguageModelV1 = provider.getModelInstance({
