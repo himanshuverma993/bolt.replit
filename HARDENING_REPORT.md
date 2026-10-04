@@ -727,13 +727,15 @@ dependencies were added for this: `@testing-library/react` 16.3.3 + `@testing-li
    `error/http_403` -> notice + exit 0. All 13 `run:` blocks still pass `bash -n` and the workflow YAML
    still parses (13 steps).
 
+| `app/components/chat/APIKeyManager.spec.ts` (3 tests) | The provider key panel: the Cloudflare provider is rendered as "no API key needed - runs on your Cloudflare account's Workers AI free tier" with no edit affordance; a keyed provider still masks a stored key and saves an edit through `setApiKey`; an unset key is not presented as an error | 3 passed |
+
 ### 12.2 Local gates at this head
 
 ```
 INSTALL_EXIT=0   (install 5s, frozen lockfile)
 TYPECHECK_EXIT=0 (tsc 11s)
 LINT_EXIT=0      (eslint 2s)
-TESTS_EXIT=0     (vitest: 169 passed | 6 skipped, 20 files passed + 1 skipped)
+TESTS_EXIT=0     (vitest: 172 passed | 6 skipped, 21 files passed + 1 skipped)
 BUILD_EXIT=0     (remix vite:build 29s)
 DRYRUN_EXIT=0    (wrangler deploy --dry-run 31s; bindings env.AI, env.ASSETS)
 ```
@@ -750,4 +752,4 @@ DRYRUN_EXIT=0    (wrangler deploy --dry-run 31s; bindings env.AI, env.ASSETS)
 | Token that can read but cannot push | 403 → `insufficient_permissions` with the update-scope hint, session kept | `github.spec.ts` + `github-route-flow.spec.ts` |
 | GitHub App installation token | `tokenKind: installation`, `repoCreate: not_allowed`, VCS import still allowed | `github.spec.ts` + the live route suite (`himanshuverma993`, installation) |
 | `env.AI` missing at runtime | `cloudflare.ts` throws *"Cloudflare Workers AI binding is unavailable. Add `[ai] binding = \"AI\"` to wrangler.toml and deploy the Worker with Workers AI enabled."* before any inference is attempted | `cloudflare.spec.ts` |
-| Cloudflare model list on the live deployment | both ids present in `/api/models`, `requiresApiKey: false`, `maxTokenAllowed: 4096` | live probe + live-verification step 9 (no API key needed) |
+| Cloudflare model list on the live deployment | `GET /api/models` returns both ids with `provider: "Cloudflare"` and `maxTokenAllowed: 4096`. Note what this endpoint does **and does not** carry: it is a flat `{name,label,provider,maxTokenAllowed}` list, so `requiresApiKey` is not part of it - the keyless behaviour comes from the provider instance (`BaseChat` passes `PROVIDER_LIST`, i.e. the provider objects, to `APIKeyManager`), which is pinned by `app/components/chat/APIKeyManager.spec.ts` and by the live inference step that reaches `env.AI.run` with no key | live probe (fetched just now) + live-verification steps 9/12 |
