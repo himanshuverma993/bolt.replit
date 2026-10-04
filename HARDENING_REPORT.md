@@ -738,6 +738,7 @@ dependencies were added for this: `@testing-library/react` 16.3.3 + `@testing-li
 ```
 
 | `app/components/chat/APIKeyManager.spec.ts` (3 tests) | The provider key panel: the Cloudflare provider is rendered as "no API key needed - runs on your Cloudflare account's Workers AI free tier" with no edit affordance; a keyed provider still masks a stored key and saves an edit through `setApiKey`; an unset key is not presented as an error | 3 passed |
+| `app/lib/stores/workbench.spec.ts` (5 tests) | The store method behind the **"Push to GitHub" button**: it pushes only text files with the work directory stripped from every path, omits unset options instead of serialising `undefined`, refuses an empty project **before** contacting the server, and lets a server classification (`insufficient_permissions` + hint) and a network failure reach the UI as typed `GitHubClientError`s | 5 passed |
 | `app/lib/.server/llm/stream-text.spec.ts` (3 tests) | The MCP tool-loop wiring in `stream-text`, with the AI SDK call mocked: **no request, no tool options** (`tools`/`maxSteps`/`toolChoice` are absent, `getMcpTools` is not even called); **request but no tools** - still absent; **tools discovered** - the tool map plus `maxSteps: 3` and `toolChoice: 'auto'`. This is the "preserve no-MCP behaviour" and "preserve the tool-loop limit" requirement, pinned behaviourally rather than by reading the source | 3 passed |
 
 ### 12.2 Local gates at this head
@@ -746,7 +747,7 @@ dependencies were added for this: `@testing-library/react` 16.3.3 + `@testing-li
 INSTALL_EXIT=0   (install 5s, frozen lockfile)
 TYPECHECK_EXIT=0 (tsc 11s)
 LINT_EXIT=0      (eslint 2s)
-TESTS_EXIT=0     (vitest: 175 passed | 6 skipped, 22 files passed + 1 skipped)
+TESTS_EXIT=0     (vitest: 180 passed | 6 skipped, 23 files passed + 1 skipped)
 BUILD_EXIT=0     (remix vite:build 29s)
 DRYRUN_EXIT=0    (wrangler deploy --dry-run 31s; bindings env.AI, env.ASSETS)
 ```
@@ -785,6 +786,9 @@ One environment quirk was found and documented in the script: `wrangler dev` ans
 streaming response with an empty body (curl, which does not negotiate gzip, receives the real 140 bytes), so
 the smoke requests ask for `Accept-Encoding: identity`. Without that, the fourth check would have "failed" for
 a reason that has nothing to do with the Worker.
+
+Confirmed in CI: at `475c3f4` the `Test` job (Node 22 + the smoke step) passed, so all four flows hold in the
+real runtime on the pipeline too, not just on this workstation.
 
 Still unverified in workerd: an actual `tools/call` execution (tools are only invoked from the chat route, which
 needs `env.AI`; the unit suite covers the call path, the output cap and the destructive-tool gate on Node).
