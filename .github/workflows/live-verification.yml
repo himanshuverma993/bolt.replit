@@ -406,6 +406,7 @@ jobs:
             let text = "";
             const frames = { text: 0, toolCall: 0, toolResult: 0, error: 0 };
             const errors = [];
+            const toolArgs = [];
             for (const line of raw.split("\n")) {
               const i = line.indexOf(":");
               if (i < 1) continue;
@@ -413,19 +414,26 @@ jobs:
               let parsed;
               try { parsed = JSON.parse(line.slice(i + 1)); } catch { continue; }
               if (tag === "0" && typeof parsed === "string") { text += parsed; frames.text += 1; }
-              else if (tag === "9" || tag === "b") frames.toolCall += 1;
+              else if (tag === "9" || tag === "b") {
+                frames.toolCall += 1;
+                if (tag === "9" && parsed && typeof parsed === "object") {
+                  toolArgs.push(JSON.stringify(parsed.args ?? null).slice(0, 200));
+                }
+              }
               else if (tag === "a") frames.toolResult += 1;
               else if (tag === "3") { frames.error += 1; errors.push(String(parsed).slice(0, 200)); }
             }
-            fs.writeFileSync("/tmp/tools.frames.json", JSON.stringify({ frames, errors }));
+            fs.writeFileSync("/tmp/tools.frames.json", JSON.stringify({ frames, errors, toolArgs }));
             fs.writeFileSync("/tmp/tools.text", text);
             console.log(`stream frames: ${JSON.stringify(frames)}`);
             console.log(`answer chars=${text.length} :: ${text.replace(/\s+/g, " ").slice(0, 160)}`);
           '
           node -e '
             const fs = require("fs");
-            const { frames, errors } = JSON.parse(fs.readFileSync("/tmp/tools.frames.json", "utf8"));
-            const note = `text=${frames.text} toolCall=${frames.toolCall} toolResult=${frames.toolResult}`;
+            const { frames, errors, toolArgs } = JSON.parse(fs.readFileSync("/tmp/tools.frames.json", "utf8"));
+            const sampleArgs = (toolArgs || []).find((args) => args && args !== "null" && args !== "{}");
+            const note = `text=${frames.text} toolCall=${frames.toolCall} toolResult=${frames.toolResult}` +
+              (sampleArgs ? ` args=${sampleArgs}` : "");
             if (frames.error > 0) {
               fs.writeFileSync("/tmp/tools.state", "error_frame");
               console.log(`stream error frame: ${errors.join(" | ")}`);
@@ -437,6 +445,9 @@ jobs:
             }
             fs.writeFileSync("/tmp/tools.state", "ok");
             const text = fs.readFileSync("/tmp/tools.text", "utf8");
+            if (sampleArgs) {
+              console.log(`::notice::production streamed a tool call with arguments (${note})`);
+            }
             if (frames.toolResult > 0) {
               console.log(`::notice::production executed an MCP tool inside a Workers AI chat (${note})`);
             }
