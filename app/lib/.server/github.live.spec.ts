@@ -156,7 +156,7 @@ describeLive('live GitHub route (read-only)', () => {
     expect(connected.connected).toBe(true);
     expect(connected.login).toBeTruthy();
     expect(connected.tokenKind).toBe('installation');
-    expect(connected.repoCreate).not.toBe('allowed');
+    expect(connected.repoCreate).toBe('not_allowed');
     expect(session).toContain('HttpOnly');
     expect(session).not.toContain(token!);
     expect(JSON.stringify(connected)).not.toContain(token!);
@@ -177,10 +177,22 @@ describeLive('live GitHub route (read-only)', () => {
     expect(JSON.stringify(statusBody)).not.toContain(token!);
 
     /*
-     * With `installation` tokens GitHub answers 403 for POST /user/repos, so the
-     * attempt cannot create anything - it exists to prove the route classifies
-     * the refusal instead of failing silently.
+     * Write safety: this suite must never create a repository. `repoCreate` is
+     * only `not_allowed` when the token provably cannot create one (an
+     * installation token, or a classic token without the `repo` scope). Any
+     * other token kind may write, and a fine-grained token with Administration
+     * write reports `unverified`, so in that case the attempt is skipped
+     * entirely instead of risking a real write on an unsanctioned run.
      */
+    if (connected.repoCreate !== 'not_allowed') {
+      console.warn(
+        `[github-live] refusing to attempt a repository creation with repoCreate=${String(connected.repoCreate)}; ` +
+          'set GITHUB_E2E_ALLOW_WRITES=1 for the disposable-repository flow if a write is intended',
+      );
+
+      return;
+    }
+
     const push = await action({
       request: post(
         { action: 'push', repoName, files: [{ path: 'README.md', content: '# live route test\n' }] },
@@ -190,7 +202,6 @@ describeLive('live GitHub route (read-only)', () => {
     } as unknown as Parameters<typeof action>[0]);
     const pushBody = (await push.json()) as Record<string, unknown>;
 
-    expect(connected.repoCreate).toBe('not_allowed');
     expect(push.status).toBe(403);
     expect(pushBody.code).toBe('insufficient_permissions');
     expect(String(pushBody.hint)).toMatch(/Administration|create the repository on GitHub first/i);

@@ -423,6 +423,42 @@ jobs:
             console.log(`::warning::the remote MCP server refused anonymous access; classified as ${detail}`);
           '
 
+          # Cloudflare's own MCP server requires OAuth. It must never be reported
+          # as connected when no credentials were supplied, and the refusal must
+          # carry a classification instead of a bare "unknown".
+          code=$(curl -sS --max-time 60 -o /tmp/mcp-cf.json -w '%{http_code}' -X POST "$BASE/api/mcp" \
+            -H 'Content-Type: application/json' -H "Origin: $BASE" -c /tmp/mcp-cf.jar \
+            --data '{"action":"add","name":"cloudflare-oauth","url":"https://mcp.cloudflare.com/mcp"}') || code=000
+          echo "POST /api/mcp (oauth-only server) -> $code :: $(head -c 300 /tmp/mcp-cf.json | tr -d '\r' | tr '\n' '|')"
+          [ "$code" = "200" ] || { echo "::error::an OAuth-only MCP server returned HTTP $code"; exit 1; }
+          if grep -qiE 'access_token|refresh_token|"token"' /tmp/mcp-cf.json; then
+            echo "::error::the OAuth-only MCP response exposed token material"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const body = JSON.parse(fs.readFileSync("/tmp/mcp-cf.json", "utf8"));
+            const server = body.server || {};
+            const classified = ["http_401", "http_403", "oauth_required", "invalid_bearer_token", "protocol_negotiation_failed", "tools_list_failed", "network", "dns", "tls"];
+            if (server.status === "connected") {
+              console.log(`::error::an OAuth-only MCP server was reported connected without credentials (tools: ${(server.tools || []).length})`);
+              process.exit(2);
+            }
+            if (server.status !== "auth_required" && server.status !== "error") {
+              console.log(`::error::unexpected status for an OAuth-only MCP server :: ${server.status}`);
+              process.exit(3);
+            }
+            if (!server.statusCode || server.statusCode === "unknown") {
+              console.log(`::error::the OAuth-only MCP refusal was not classified :: ${JSON.stringify({ status: server.status, statusCode: server.statusCode, statusMessage: server.statusMessage }).slice(0, 300)}`);
+              process.exit(4);
+            }
+            if (!classified.includes(server.statusCode)) {
+              console.log(`::warning::the OAuth-only MCP server refused with an unexpected classification :: ${server.statusCode} :: ${String(server.statusMessage || "").slice(0, 200)}`);
+              process.exit(0);
+            }
+            console.log(`::notice::the OAuth-only MCP server was refused and classified as ${server.status} / ${server.statusCode}`);
+          '
+
       - name: MCP OAuth callback rejects a forged redirect without contacting the authorization server
         if: ${{ steps.target.outputs.is_production == 'false' }}
         run: |

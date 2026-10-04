@@ -708,6 +708,25 @@ dependencies were added for this: `@testing-library/react` 16.3.3 + `@testing-li
 | `app/components/settings/connections/ConnectionsTab.spec.ts` (5 tests) | The GitHub panel as rendered: the missing-secret banner and a disabled Connect button when storage is not configured; Connect sends exactly `{action:'connect', token, repo}` with the token **only in the JSON body**, then renders the verified card (login, installation-token explanation, "repository creation not permitted", repository access, `GitHub authentication: valid`) and removes the token input from the DOM; a 403 renders the server's message **and its hint** and refreshes the status; opening the panel purges the legacy `githubToken`/`git:github.com`/`githubUsername` cookies; Disconnect posts `{action:'disconnect'}` and returns to the form; Verify re-verifies and drops the "stale" marker. In every case `document.cookie` and `document.body.innerHTML` contain no token | 5 passed |
 | `app/components/settings/connections/McpConnections.spec.ts` (6 tests) | The MCP panel as rendered: an OAuth-only server shows "Authentication required" plus a **Connect with OAuth** action and never "Connected"; the catalog buttons advertise Cloudflare and Figma as `(OAuth required)` and `Use Cloudflare` fills `https://mcp.cloudflare.com/mcp`; adding that server without a token is classified as auth-required instead of silently connecting, while the bearer token travels only in the JSON body and appears nowhere in the DOM; a `javascript:` **and** a plain-`http` remote authorization URL are both refused by the client; a classified failure keeps its `[http_401]` code, message and hint; the risky-tool checkbox posts `set-allow-risky` with `allowRiskyTools: true`; an OAuth callback result (`?mcp_oauth=error&reason=missing_state_cookie`) is surfaced and stripped from the URL; the missing-credential-secret warning and warnings list render, `Revoke OAuth` only appears for a connected OAuth server, and Remove deletes the server through the API | 6 passed |
 
+### 12.1c Two live-harness fixes and one new live assertion
+
+1. **Unsanctioned write removed from the live GitHub harness.** `app/lib/.server/github.live.spec.ts`
+   drives the real `push` route against the real GitHub API to prove the 403 classification. It already
+   asserted that an installation token is `not_allowed`, but a *fine-grained* token with Contents +
+   Administration write reports `unverified`, which passed that assertion and would then have created a
+   repository for real - and the `afterAll` cleanup only runs when `GITHUB_E2E_ALLOW_WRITES=1`. The push
+   attempt now requires `repoCreate === 'not_allowed'` (the token provably cannot create repositories);
+   any other kind is skipped with a `[github-live]` warning. Re-run after the change:
+   `[github-live] login=himanshuverma993 tokenKind=installation scopes=none repoCreate=not_allowed`,
+   `5 passed | 1 skipped`, and the 403 `insufficient_permissions` assertion still executed.
+2. **Live assertion that an OAuth-only MCP server is never "connected".** The live MCP step now also adds
+   Cloudflare's own OAuth-protected server (`https://mcp.cloudflare.com/mcp`) and fails if it is reported
+   `connected` without credentials or if the refusal has no classification (`unknown`/missing). The step
+   body was executed against canned responses: `auth_required/http_401` -> notice + exit 0,
+   `connected` with tools -> exit 2, `error/unknown` -> exit 4, `error` with no code -> exit 4,
+   `error/http_403` -> notice + exit 0. All 13 `run:` blocks still pass `bash -n` and the workflow YAML
+   still parses (13 steps).
+
 ### 12.2 Local gates at this head
 
 ```
