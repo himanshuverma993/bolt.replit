@@ -99,10 +99,12 @@ explicitly instead of silently falling back to insecure storage.
 
 ### Tests added
 
-`app/lib/.server/github.spec.ts` (20), `app/lib/.server/mcp.spec.ts` (13, rewritten), `app/lib/.server/mcp-oauth.spec.ts` (10),
-`app/lib/.server/github-route.spec.ts` (9), `app/lib/.server/mcp-route.spec.ts` (11), `app/lib/settings/export.spec.ts` (3),
-`app/lib/security/credential-handling.spec.ts` (5), `app/lib/modules/llm/providers/cloudflare.config.spec.ts` (4),
-`app/lib/.server/github.live.spec.ts` (opt-in live suite).
+`app/lib/.server/github.spec.ts` (25), `app/lib/.server/mcp.spec.ts` (14, rewritten), `app/lib/.server/mcp-oauth.spec.ts` (11),
+`app/lib/.server/secrets.spec.ts` (11, new — sealing, signing, cookie policy, redaction, origin checks),
+`app/lib/.server/github-route.spec.ts` (11), `app/lib/.server/mcp-route.spec.ts` (11),
+`app/lib/settings/export.spec.ts` (3), `app/lib/security/credential-handling.spec.ts` (5),
+`app/lib/modules/llm/providers/cloudflare.spec.ts` (6, extended), `app/lib/modules/llm/providers/cloudflare.config.spec.ts` (4),
+`app/lib/.server/github.live.spec.ts` (opt-in live suite). Total suite: **135 passing, 3 opt-in skips**.
 
 The two route-level suites live in `app/lib/.server/` and import `~/routes/api.github` / `~/routes/api.mcp`:
 Remix strips server-only exports from modules inside `app/routes/`, so a spec file placed there broke the
@@ -159,6 +161,14 @@ Command: `pnpm exec vitest --run` (Node 22.22.3, pnpm 9.4.0). See §7 for the ex
 | GitHub token never in settings export | `settings/export.spec.ts` (export + import + `assertExportIsCredentialFree`) |
 | GitHub disconnect clears session state | `github-route.spec.ts` → "clears the session and the legacy cookies on disconnect" |
 | GitHub identity + repository permission checks | `github.spec.ts` → identity/scopes/repo permission, read-but-not-push detection, identity mismatch |
+| GitHub App installation token detection | `github.spec.ts` → "detects a GitHub App installation token…" (installation permissions → `repoCreate: not_allowed`), live run in §6.2 |
+| GitHub push never loses a commit | `github.spec.ts` → "updates the branch instead of losing the commit when a repository reports size 0 but already has a branch", "writes the first commit when the branch does not exist yet (404 on the ref)" |
+| GitHub cookie headers are valid HTTP | `github-route.spec.ts` → "clears every legacy cookie as its own Set-Cookie header when connect fails" |
+| Push limits are enforced, not silently applied | `github-route.spec.ts` → "refuses a push with more files than the limit instead of silently dropping them" |
+| OAuth redirect cannot reach `window.location` as `javascript:` | `mcp.spec.ts` → "only allows https (or loopback http) authorization URLs to reach the browser" |
+| Secure-cookie capacity degrades safely | `mcp-oauth.spec.ts` → "drops the discovery cache instead of failing when the sealed store is too large" |
+| Workers AI tool loop keeps call/result association | `cloudflare.spec.ts` → "sends tool results with their tool_call_id…", "omits tool definitions when toolChoice is none" |
+| Secret sealing, signing and redaction | `secrets.spec.ts` (round-trip, tamper, wrong key, signed-cookie tamper, cookie policy, `sk-`/`xox`/`AKIA`/`ghp_` redaction, Origin checks) |
 | GitHub mocked create/update/push flow | `github.spec.ts` → create repo + first commit, update with parented commit, empty repo (409), conflict retry, 3-attempt failure |
 | GitHub API errors and rate limits | `github.spec.ts` → 401/403/404/409/429/network classification, token never in message |
 | MCP authless discovery | `mcp.spec.ts`, `mcp-route.spec.ts` |
@@ -195,6 +205,7 @@ Two live runs of `.github/workflows/live-verification.yml` (GitHub's network, no
 | Real Workers AI inference (`env.AI.run`) | ✅ production: `POST /api/chat` → HTTP 200, AI SDK v4 data stream (`0:"..."` frames) whose concatenated text contains `LIVE_OK` | production run, step 7 |
 | Clear error when the binding is missing | ✅ the preview deployment (no `env.AI`, see §8.2) returns `Cloudflare Workers AI binding is unavailable. Add [ai] binding = "AI" to wrangler.toml and deploy the Worker with Workers AI enabled.` | preview run, step 7 |
 | Credential-shaped values in the chat error path | ✅ none (`sk-…`, `gh[pousr]_…` scan) | both runs, step 8 |
+| Credential storage fails closed without a Worker secret | ✅ preview: `POST /api/mcp` with a bearer token → HTTP 501 naming `APP_ENCRYPTION_SECRET`, credential not echoed | preview run, step 9 |
 | Deployed bundle == merged revision | ✅ the served entry bundle embeds `b3b6ec4`, the current `main` tip | production run, step 9 |
 | GitHub least-privilege connection | ⚠️ partial — read-only verification, §6.2 | `github.live.spec.ts` against the real API |
 | GitHub disposable repository create/push/update | ⛔ **BLOCKED** — needs a fine-grained PAT (§6.2, §8.4) | — |
@@ -229,9 +240,20 @@ Executed live, read-only (no writes to any repository):
 ```
 NODE_EXTRA_CA_CERTS=… GITHUB_E2E_TOKEN=… GITHUB_E2E_REPO=himanshuverma993/bolt.replit \
   pnpm exec vitest --run app/lib/.server/github.live.spec.ts
-→ [github-live] login=himanshuverma993 tokenKind=unknown scopes=none repoCreate=unverified
+→ [github-live] login=himanshuverma993 tokenKind=installation scopes=none repoCreate=not_allowed
 → [github-live] repo=himanshuverma993/bolt.replit exists=true push=true admin=true
 → 2 passed | 1 skipped
+```
+
+`tokenKind=installation` and `repoCreate=not_allowed` are produced by the deep-audit change that probes
+`GET /user/installations`; earlier the same token was reported as `unknown` / `unverified`. The probe
+was verified independently with the raw API:
+
+```
+GET  /user/installations → installation 155860339 (account himanshuverma993), permissions:
+     checks:read issues:read actions:read contents:write metadata:read statuses:read
+     workflows:write pull_requests:write repository_hooks:write      (no `administration`)
+POST /user/repos         → HTTP 403 {"message":"Resource not accessible by integration"}
 ```
 
 **Where the write test stops and why it is blocked:** the only GitHub credential available inside this
@@ -278,8 +300,7 @@ from.
 Runner: `/tmp/evidence/run-gates.sh`, log: `/tmp/evidence/gates.log` (`pnpm install --frozen-lockfile`,
 `pnpm run typecheck`, `pnpm run lint`, `pnpm exec vitest --run`, `pnpm run build`,
 `npx wrangler deploy --dry-run`; exit codes captured per step with `set -o pipefail`). The table below
-was reproduced at the final commit (`956823f`) with identical results — app code is unchanged since
-`37e2df7`, only the live-verification workflow and this report changed afterwards.
+is the run on the current head of the branch (`9ddfac0`, the deep-audit commit) — every gate exits 0.
 
 Baseline (before changes, commit `b3b6ec4`): install ✅, typecheck ✅, lint ✅, tests 44/44 ✅,
 build ✅, `wrangler deploy --dry-run` ✅ (3.84 MiB bundle, 329 assets).
@@ -292,11 +313,13 @@ with `set -o pipefail`):
 | Frozen install | `pnpm install --frozen-lockfile` | 0 | lockfile up to date, 6 s |
 | Typecheck | `pnpm run typecheck` (`tsc`) | 0 | clean |
 | Lint | `pnpm run lint` (eslint, blitz config) | 0 | clean |
-| Tests | `pnpm exec vitest --run` | 0 | **113 passed, 3 skipped, 14 files** (baseline: 44 passed, 6 files) |
-| Production build | `pnpm run build` | 0 | client + SSR bundle (`build/server/index.js` 235.49 kB) |
-| Worker dry-run | `npx wrangler deploy --dry-run` | 0 | 333 asset files, `Total Upload: 3428.64 KiB / gzip: 681.45 KiB`, bindings **`env.AI → AI`** and `env.ASSETS → Assets` |
+| Tests | `pnpm exec vitest --run` | 0 | **135 passed, 3 skipped, 15 files** (baseline: 44 passed, 6 files) |
+| Production build | `pnpm run build` | 0 | client + SSR bundle (`build/server/index.js` 239.31 kB) |
+| Worker dry-run | `npx wrangler deploy --dry-run` | 0 | 333 asset files, `Total Upload: 3432.69 KiB / gzip: 682.43 KiB`, bindings **`env.AI → AI`** and `env.ASSETS → Assets` |
 
-The 3 skipped tests are the opt-in live GitHub write suite (`GITHUB_E2E_ALLOW_WRITES` unset).
+The 3 skipped tests are the opt-in live GitHub suite: two read-only verifications (no
+`GITHUB_E2E_TOKEN`) and the disposable-repository write flow (no `GITHUB_E2E_ALLOW_WRITES`). The
+read-only pair was executed separately against the real API — see §6.2 and §10.
 `Tests closed successfully but something prevents Vite server from exiting` is pre-existing noise:
 the baseline commit `b3b6ec4` prints the same message and also exits 0.
 
@@ -335,6 +358,25 @@ the baseline commit `b3b6ec4` prints the same message and also exits 0.
    check-run annotations; those annotations are the quoted live evidence in §6.
 7. `pnpm exec vitest` prints `close timed out after 10000ms … prevents Vite server from exiting`
    (pre-existing, exit code stays 0) — noise, not a failure.
+8. **Provider API keys are still stored in the JavaScript-readable `apiKeys` cookie** (pre-existing
+   bolt.diy architecture: the browser sends them with every chat request). They are excluded from
+   settings export and rejected on import (`settings/export.spec.ts`), but any XSS on the deployment
+   could read them. Moving provider keys server-side is an architecture change and was out of scope for
+   this hardening pass; the sealing/signing primitives needed for it are already in
+   `app/lib/.server/secrets.ts`.
+9. **Dependency advisories are pre-existing and unchanged.** `pnpm audit --prod` reports 53 advisories
+   (2 critical, 18 high, 21 moderate, 12 low) and the dependency set is byte-identical to `main`
+   (`git diff main...HEAD -- package.json pnpm-lock.yaml` is empty). The connected ones are
+   `sha.js` via `isomorphic-git` (critical), React Router path traversal / XSS advisories in
+   `@remix-run/*` 2.15.0 (critical + high), `js-cookie` prototype hijack (high), `jsondiffpatch`
+   prototype pollution pulled in by `ai@4.0.18` (high) and `undici` DoS advisories via `remix-utils`
+   (high). Fixing them means upgrading Remix / the AI SDK, which this mission explicitly forbids here —
+   they need a separate, dedicated dependency PR.
+10. **A token refresh that happens inside a chat tool call is not persisted.** A streaming chat response
+    cannot set cookies, so `transportAuthProvider` can rotate an access token in memory without writing
+    it back; the Settings → Refresh path does persist rotations. Consequence: with an MCP provider that
+    rotates refresh tokens on every use, a long chat may need one re-authorization. Tool discovery and
+    calls themselves are unaffected.
 
 ### Manual steps required from the user
 
@@ -371,6 +413,9 @@ the baseline commit `b3b6ec4` prints the same message and also exits 0.
 7. **Optional**: if branch previews should also exercise Workers AI, add an AI binding inside the
    existing `[previews]` block of `wrangler.toml`. This was deliberately left untouched because the
    empty block is part of the current intentional configuration.
+8. **Optional**: the live workflow now also probes that credential storage fails closed (HTTP 501 with an
+   actionable hint, credential never echoed) on the branch preview. Once `APP_ENCRYPTION_SECRET` is set
+   on production, the same step reports a warning instead of failing, because the expectation changes.
 
 ---
 
@@ -380,6 +425,8 @@ the baseline commit `b3b6ec4` prints the same message and also exits 0.
   this session.
 * Hardening commit: **`37e2df7`** — `fix(security): server-side GitHub auth, MCP OAuth and hardened credentials`
   (application code, tests, `HARDENING_REPORT.md`).
+* Deep-audit commit: **`9ddfac0`** — `fix(audit): close cookie-header, push-loss, OAuth-redirect and tool-loop gaps`
+  (the findings in §10, plus their tests; see §3 for the files).
 * Follow-up commits on the branch are CI-only and touch `.github/workflows/live-verification.yml`
   exclusively: `5369666`, `8103fa9`, `26b5671`, `dcba1eb`, `efc5285`, `cff1d34`, `9f9c040`, `974b5b7`,
   `6abdb6e`, `0c42a4c`.
@@ -388,3 +435,107 @@ the baseline commit `b3b6ec4` prints the same message and also exits 0.
 
 Both live runs referenced in §6 are attached to this branch: production was probed at the merged `main`
 revision and the branch preview at the hardened revision.
+
+---
+
+## 10. Deep audit (second pass)
+
+Everything that was skipped, blocked or assumed in the first pass was re-examined, and the whole change
+surface was re-read line by line. This section is the record; the fixes below are in commit `9ddfac0`.
+
+### 10.1 The skipped tests, re-verified
+
+`pnpm exec vitest --run` reports exactly three skips, all inside `app/lib/.server/github.live.spec.ts`:
+
+| Test | Status |
+|---|---|
+| live GitHub verification — identity/token kind | ✅ **executed** against the real API (`tokenKind=installation`, see §6.2) |
+| live GitHub verification — repository permissions | ✅ **executed** against the real API (`exists=true push=true admin=true`) |
+| live GitHub push — disposable repository write flow | ⛔ blocked, with hard evidence (below) |
+
+Why the write test cannot run in this environment — verified with the raw API rather than assumed:
+
+```
+token         → GitHub App installation token (client id Iv23lifFg4c9eT1T6hLC, installation 155860339,
+                expires 2026-10-04 21:16 UTC, permissions listed in §6.2)
+POST /user/repos → 403 Resource not accessible by integration   (no `administration` permission)
+GET  /user/orgs  → []                                           (no organisation to create in)
+```
+
+There is no other credential in the sandbox (`env` holds only `GH_TOKEN`/`GITHUB_TOKEN`, the same
+installation token; no `~/.netrc`, no git credential helper, no gh hosts file), and pushing to
+`himanshuverma993/bolt.replit` is forbidden as a test. The command that closes this gate remains:
+
+```bash
+GITHUB_E2E_TOKEN=<fine-grained PAT with Contents/Administration read+write> \
+  GITHUB_E2E_ALLOW_WRITES=1 pnpm exec vitest --run app/lib/.server/github.live.spec.ts
+```
+
+### 10.2 Defects found and fixed in this pass
+
+1. **Invalid `Set-Cookie` header on the failed-connect path** (`app/routes/api.github.ts`): several
+   cookies were joined with `", "` into one header. Browsers would have kept the legacy
+   JS-readable credential cookie. Now one header per cookie; asserted by
+   `github-route.spec.ts` → "clears every legacy cookie as its own Set-Cookie header".
+2. **A push could be silently lost** (`pushProjectToGitHub`): for a repository that reports `size: 0` but
+   already has a branch, the first-commit path swallowed the `422 Reference already exists` conflict and
+   returned a commit SHA that was never attached to a ref — every file silently dropped. The
+   first-commit helper now reports whether the ref was created and the flow falls back to the normal
+   branch-update path; the classifier maps `422 Reference already exists` to `branch_conflict`.
+   Two new tests cover both directions (size 0 + existing branch, and 404 on the ref).
+3. **GitHub App installation tokens were mislabelled** (`verifyGitHubToken`): they were reported as
+   `tokenKind: unknown` / `repoCreate: unverified`, which invites a user to try a flow that GitHub will
+   always refuse. `GET /user/installations` now classifies them (`tokenKind: installation`) and
+   `repoCreate` is `not_allowed` unless the installation carries `administration: write`. Live-verified
+   (§6.2); the Settings UI shows a plain-language label and an actionable hint.
+4. **Files beyond the push limit were silently dropped** (`normalizeFiles` used `slice`): now an explicit
+   `400` naming the 2000-file limit, plus a 12 MiB `Content-Length` guard returning `413`.
+5. **OAuth authorization URL reached `window.location` unchecked**: a hostile MCP server could have
+   answered with `javascript:` (script execution in Bolt's origin) or a plain-http URL.
+   `assertSafeAuthorizationUrl()` (server) and a second check in `McpConnections.tsx` (client) now allow
+   only `https:` — with `http://127.0.0.1|localhost` for local development and tests.
+6. **MCP OAuth storage limit could break the whole flow**: the sealed `mcp_oauth` cookie holds every
+   server's tokens *and* the discovery cache, and long JWT access tokens plus two servers exceed the
+   ~3.5 KB budget. The discovery cache (re-fetched automatically) is now evicted first; tokens survive.
+7. **`validateOAuthState`** now compares through the constant-time helper instead of `!==`.
+8. **Workers AI tool loop had no call/result association**: tool messages now carry `tool_call_id`
+   (the documented Workers AI / OpenAI-compatible field), so a multi-step MCP tool loop can be resolved
+   by the model; tool definitions are still omitted when `toolChoice` is `none` (the no-MCP path).
+9. **Redaction widened**: bare `sk-…`, `xox…-…` and `AKIA…` shapes are redacted in `redactSecrets()` and
+   `getErrorMessage()`, and MCP OAuth discovery errors are redacted before they reach the UI or the log.
+10. **Workflow hygiene**: the dispatch input, branch name, `github.token` and `github.sha` are passed
+    through `env:` instead of being interpolated into shell scripts, and `base_url` is validated with a
+    strict URL character class (removes a shell-injection path for anyone with dispatch rights).
+11. **`package.json` `deploy` script** ran `wrangler pages deploy` although this project is a Worker
+    (`wrangler.toml` with `main` + `[assets]`); it is now `wrangler deploy`. `start`/`preview` still use
+    the legacy Pages dev command and are documented as such.
+
+### 10.3 Checks that came back clean
+
+* **No server code or secret material in the client bundle**: `build/client` contains
+  `sealJsonPayload`, `openJsonPayload`, `requireOAuthSecret`, `@octokit/rest` → 0 occurrences; the only
+  hits for `APP_ENCRYPTION_SECRET`, `gh_session`, `mcpSecrets`, `mcp_oauth` are UI copy, the
+  export deny-list and the `?mcp_oauth=` redirect parameter.
+* **No client-side write of a credential**: `git:github.com` / `githubToken` / `githubUsername` appear
+  only in the *clearing* path and the deny-lists; `Cookies.set` calls are limited to provider keys and
+  UI settings (pre-existing).
+* **No placeholders left**: no `TODO`/`FIXME`/`XXX` in the changed scope, and the only skipped tests in
+  the repository are the two opt-in live suites listed above.
+* **Configuration untouched**: `wrangler.toml` (AI binding, `keep_vars`, intentionally empty
+  `[previews]`), `workers/entry.ts` and `worker-configuration.d.ts` are unchanged apart from the secret
+  type declarations added earlier.
+* **No tracked secrets**: `.env.example` holds empty placeholders only; no `.env`/`.dev.vars` is tracked;
+  the full branch diff contains no live credential (only the deliberate `ghp_abcdef…` fixtures in tests).
+* **Repo workflows**: no `pull_request_target`, no untrusted `github.event.*` interpolation, and the new
+  live-verification workflow uses no secrets at all.
+* **CSRF and logging**: every state-changing POST checks `Origin` (`isSameOriginRequest`), and both new
+  endpoints log exclusively through `redactSecrets`.
+* **Client-side token handling**: the one-off push token lives in a local variable / React state only
+  (`Workbench.client.tsx`), and `useGit.ts` keeps clone credentials in a module-level `Map` that is
+  never persisted.
+
+### 10.4 Still blocked (unchanged)
+
+Live Cloudflare MCP, live Figma MCP (interactive OAuth + plan), the disposable-repository push
+(fine-grained PAT), `wrangler secret put APP_ENCRYPTION_SECRET` (no Cloudflare credentials in this
+session) and Phase 5 of the roadmap. Each one is listed with its exact manual step in §8.
