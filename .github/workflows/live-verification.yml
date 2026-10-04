@@ -27,16 +27,25 @@ jobs:
     steps:
       - name: Resolve target
         id: target
+        env:
+          INPUT_BASE_URL: ${{ github.event.inputs.base_url }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -uo pipefail
           DEFAULT="https://bolt-replit.biharzone37.workers.dev"
-          BASE="${{ github.event.inputs.base_url || '' }}"
+          BASE="$INPUT_BASE_URL"
+
+          # The value is echoed into later shell steps, so validate it strictly.
+          if [ -n "$BASE" ] && ! printf '%s' "$BASE" | grep -Eq '^https?://[A-Za-z0-9._~:/?#@&=%+,-]+$'; then
+            echo "::error::base_url must be an http(s) URL without shell metacharacters"
+            exit 1
+          fi
           if [ -z "$BASE" ]; then
             BASE="$DEFAULT"
-            if [ "${{ github.ref_name }}" != "main" ]; then
+            if [ "$REF_NAME" != "main" ]; then
               # Cloudflare Workers Builds publishes a preview deployment for the pushed
               # branch; probe it first so a branch is verified before it reaches main.
-              slug=$(echo "${{ github.ref_name }}" | tr '/' '-' | tr -cd 'a-z0-9-' | cut -c1-40)
+              slug=$(echo "$REF_NAME" | tr '/' '-' | tr -cd 'a-z0-9-' | cut -c1-40)
               for candidate in \
                 "https://${slug}-bolt-replit.biharzone37.workers.dev" \
                 "https://${slug}.biharzone37.workers.dev" \
@@ -197,7 +206,37 @@ jobs:
           fi
           echo 'no credential-shaped values in the error response'
 
+      - name: Credential storage fails closed and never echoes the credential
+        if: ${{ steps.target.outputs.is_production == 'false' }}
+        run: |
+          set -uo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          code=$(curl -sS -o /tmp/mcp-add.json -w '%{http_code}' -X POST "$BASE/api/mcp" \
+            -H 'Content-Type: application/json' \
+            --data '{"action":"add","name":"fail-closed-probe","url":"https://example.com/mcp","token":"bearer-probe-do-not-store"}' \
+            || echo 000)
+          body=$(head -c 400 /tmp/mcp-add.json | tr -d '\r' | tr '\n' '|' | sed 's/%/%25/g')
+          echo "POST /api/mcp (add + bearer, no Worker secret) -> $code :: $body"
+          if grep -q 'bearer-probe-do-not-store' /tmp/mcp-add.json; then
+            echo "::error::the MCP endpoint echoed the credential it was sent :: $body"
+            exit 1
+          fi
+          if [ "$code" = "501" ]; then
+            grep -q 'APP_ENCRYPTION_SECRET' /tmp/mcp-add.json || {
+              echo "::error::501 without a hint naming the missing secret :: $body"
+              exit 1
+            }
+            echo "::notice::credential storage fails closed without a Worker secret (HTTP 501) and the credential was not echoed"
+          else
+            echo "::warning::expected 501 (no Worker secret) but got HTTP $code; credential-echo check still passed"
+          fi
+
       - name: Deployed bundle embeds the deployed commit (staleness check)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PUSHED_SHA: ${{ github.sha }}
+          IS_PRODUCTION: ${{ steps.target.outputs.is_production }}
         run: |
           set -uo pipefail
           BASE="${{ steps.target.outputs.base }}"
@@ -213,15 +252,15 @@ jobs:
             echo "::warning::could not download the entry bundle (HTTP $code); skipping the staleness check"
             exit 0
           fi
-          if [ "${{ steps.target.outputs.is_production }}" = "true" ]; then
+          if [ "$IS_PRODUCTION" = "true" ]; then
             expected="main tip"
-            main_short=$(curl -sS -H "Authorization: Bearer ${{ github.token }}" \
-              "https://api.github.com/repos/${{ github.repository }}/commits/main" \
+            main_short=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/commits/main" \
               | node -e 'let d="";process.stdin.on("data",(c)=>d+=c).on("end",()=>{try{console.log(JSON.parse(d).sha.slice(0,7))}catch{console.log("unknown")}})' || echo unknown)
           else
             # No checkout step runs here; the pushed revision is on the event payload.
             expected="pushed commit"
-            main_short=$(echo "${{ github.sha }}" | cut -c1-7)
+            main_short=$(echo "$PUSHED_SHA" | cut -c1-7)
           fi
           markers=$(node -e '
             const fs = require("fs");

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 // Route-level tests live outside app/routes so Remix does not treat them as routes.
 import { action, loader } from '~/routes/api.github';
-import { GITHUB_SESSION_COOKIE } from '~/lib/.server/github';
+import { GITHUB_MAX_FILES, GITHUB_SESSION_COOKIE, githubSessionHeaders } from '~/lib/.server/github';
 
 /**
  * Route-level tests for the server-side GitHub endpoint.
@@ -73,6 +73,53 @@ describe('POST /api/github', () => {
     } as unknown as Parameters<typeof action>[0]);
 
     expect(response.status).toBe(400);
+  });
+
+  it('clears every legacy cookie as its own Set-Cookie header when connect fails', async () => {
+    const response = await action({
+      request: postRequest({ action: 'connect', token: 'not a token' }),
+      context: contextFor({ APP_ENCRYPTION_SECRET: SECRET }),
+    } as unknown as Parameters<typeof action>[0]);
+    const cookies = response.headers.getSetCookie();
+
+    /*
+     * Joining cookies into one header value is invalid HTTP and browsers would
+     * keep the old credential cookie; every cookie needs its own header.
+     */
+    for (const name of [GITHUB_SESSION_COOKIE, 'githubToken', 'githubUsername', 'git:github.com']) {
+      expect(cookies.some((cookie) => cookie.startsWith(`${name}=`) && cookie.includes('Max-Age=0'))).toBe(true);
+    }
+  });
+
+  it('refuses a push with more files than the limit instead of silently dropping them', async () => {
+    const [sessionCookie] = await githubSessionHeaders(
+      {
+        token: 'ghp_test_token_value',
+        connection: {
+          login: 'octocat',
+          name: null,
+          avatarUrl: null,
+          scopes: ['repo'],
+          tokenKind: 'classic',
+          repoCreate: 'allowed',
+          verifiedAt: new Date().toISOString(),
+        },
+      },
+      { APP_ENCRYPTION_SECRET: SECRET },
+    );
+    const files = Array.from({ length: GITHUB_MAX_FILES + 1 }, (_value, index) => ({
+      path: `file-${index}.txt`,
+      content: 'x',
+    }));
+    const response = await action({
+      request: postRequest({ action: 'push', repoName: 'demo', files }, sessionCookie.split(';')[0]),
+      context: contextFor({ APP_ENCRYPTION_SECRET: SECRET }),
+    } as unknown as Parameters<typeof action>[0]);
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(400);
+    expect(body.code).toBe('invalid_request');
+    expect(String(body.error)).toContain(String(GITHUB_MAX_FILES));
   });
 
   it('clears the session and the legacy cookies on disconnect', async () => {

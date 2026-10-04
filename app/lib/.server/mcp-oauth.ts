@@ -27,8 +27,10 @@ import {
   openJsonPayload,
   readRequestCookies,
   resolveAppSecret,
+  redactSecrets,
   sealJsonPayload,
   serializeCookie,
+  signaturesMatch,
   type SecretEnvironment,
 } from '~/lib/.server/secrets';
 
@@ -128,9 +130,24 @@ export async function oauthStoreHeaders(store: McpOAuthStore, env: SecretEnviron
     return [clearCookie(MCP_OAUTH_COOKIE, { httpOnly: true })];
   }
 
-  const sealed = await sealJsonPayload(store, secret.value);
+  const fits = (value: string) => new TextEncoder().encode(value).byteLength <= MCP_OAUTH_COOKIE_LIMIT_BYTES;
+  let sealed = await sealJsonPayload(store, secret.value);
 
-  if (new TextEncoder().encode(sealed).byteLength > MCP_OAUTH_COOKIE_LIMIT_BYTES) {
+  if (!fits(sealed)) {
+    /*
+     * Discovery metadata is a cache: the SDK re-runs RFC 9728/8414 discovery on
+     * the next request, so dropping it costs one round trip and is always
+     * preferable to losing the tokens (or failing the flow). Access tokens are
+     * often long JWTs, and the practical cookie limit is about 4 KiB.
+     */
+    for (const entry of Object.values(store)) {
+      entry.discovery = undefined;
+    }
+
+    sealed = await sealJsonPayload(store, secret.value);
+  }
+
+  if (!fits(sealed)) {
     throw new McpOAuthError(
       'storage_limit',
       'MCP OAuth state is too large for secure cookie storage. Disconnect MCP servers you no longer use and reconnect the ones you need.',
@@ -163,7 +180,7 @@ export function validateOAuthState(store: McpOAuthStore, serverId: string, recei
   const entry = store[serverId];
   const expected = entry?.state;
 
-  if (!expected || !receivedState || expected !== receivedState) {
+  if (!expected || !receivedState || !signaturesMatch(expected, receivedState)) {
     throw new McpOAuthError(
       'state_mismatch',
       'MCP OAuth callback rejected: the state parameter did not match the pending authorization request.',
@@ -320,10 +337,13 @@ export async function beginMcpAuthorization(options: {
   try {
     result = await auth(provider, { serverUrl: options.serverUrl, scope: options.scope });
   } catch (error) {
-    throw new McpOAuthError(
-      'oauth_failed',
-      `MCP OAuth discovery failed: ${error instanceof Error ? error.message.slice(0, 300) : 'unknown error'}`,
-    );
+    /*
+     * The SDK's discovery errors can quote response headers, so redact before the
+     * message reaches the UI or the Worker log.
+     */
+    const detail = error instanceof Error ? error.message.slice(0, 300) : 'unknown error';
+
+    throw new McpOAuthError('oauth_failed', `MCP OAuth discovery failed: ${redactSecrets(detail)}`);
   }
 
   if (result === 'AUTHORIZED') {

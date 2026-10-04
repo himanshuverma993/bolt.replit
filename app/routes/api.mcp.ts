@@ -1,6 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from '@remix-run/cloudflare';
 import { json } from '@remix-run/cloudflare';
 import {
+  assertSafeAuthorizationUrl,
   classifyMcpError,
   getMcpErrorMessage,
   mcpClientMetadataUrl,
@@ -217,7 +218,14 @@ export async function action({ request, context }: ActionFunctionArgs) {
       await appendCookies(headers, await mcpStateHeaders(servers, secrets, env, result.store));
 
       return json(
-        { status: 'redirect', authorizationUrl: result.authorizationUrl, servers, serverId: server.id },
+        {
+          status: 'redirect',
+
+          // Never hand an unvalidated URL to the browser: it ends up in window.location.
+          authorizationUrl: assertSafeAuthorizationUrl(result.authorizationUrl),
+          servers,
+          serverId: server.id,
+        },
         { headers },
       );
     } else if (operation === 'disconnect-auth') {

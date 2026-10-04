@@ -152,7 +152,20 @@ export default function McpConnections() {
       }
 
       if (action === 'authorize' && body.authorizationUrl) {
-        window.location.href = body.authorizationUrl;
+        /*
+         * Defence in depth: the server already refuses a non-https (non-loopback)
+         * authorization URL, and the browser must not navigate to `javascript:`
+         * even if a future code path forgets that check.
+         */
+        const target = new URL(body.authorizationUrl);
+        const loopback = target.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(target.hostname);
+
+        if (target.protocol !== 'https:' && !loopback) {
+          throw new Error('Refusing to redirect to a non-https authorization URL.');
+        }
+
+        window.location.href = target.toString();
+
         return;
       }
 

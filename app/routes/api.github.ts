@@ -30,6 +30,7 @@ type GitHubEnv = SecretEnvironment & {
 
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_TOTAL_BYTES = 8 * 1024 * 1024;
+const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 
 function getEnv(context: ActionFunctionArgs['context'] | LoaderFunctionArgs['context']): GitHubEnv {
   return (context.cloudflare.env ?? {}) as GitHubEnv;
@@ -55,10 +56,18 @@ function normalizeFiles(value: unknown): GitHubPushFile[] {
     throw new GitHubError('invalid_request', 'A list of project files is required for the push.');
   }
 
+  if (value.length > GITHUB_MAX_FILES) {
+    throw new GitHubError(
+      'invalid_request',
+      `This push contains ${value.length} entries, more than the ${GITHUB_MAX_FILES}-file limit.`,
+      'Remove generated artefacts (node_modules, build output) and retry. Files are never silently dropped.',
+    );
+  }
+
   const files: GitHubPushFile[] = [];
   let totalBytes = 0;
 
-  for (const entry of value.slice(0, GITHUB_MAX_FILES)) {
+  for (const entry of value) {
     if (!entry || typeof entry !== 'object') {
       continue;
     }
@@ -161,6 +170,19 @@ export async function action({ request, context }: ActionFunctionArgs) {
     return json({ error: 'Cross-origin request rejected', code: 'invalid_request' }, { status: 403 });
   }
 
+  const declaredLength = Number(request.headers.get('content-length') ?? '0');
+
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) {
+    return json(
+      {
+        error: `The request body is larger than the ${Math.round(MAX_REQUEST_BYTES / (1024 * 1024))} MiB endpoint limit.`,
+        code: 'invalid_request',
+        hint: 'Push fewer files, or exclude generated directories.',
+      },
+      { status: 413 },
+    );
+  }
+
   let body: Record<string, unknown>;
 
   try {
@@ -189,7 +211,18 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
       return json({ connected: true, ...connection, storageConfigured: true, verificationFresh: true }, { headers });
     } catch (error) {
-      return errorResponse(error, { 'Set-Cookie': clearGitHubSessionHeaders().join(', ') });
+      /*
+       * A failed connect must not leave a half-written session behind: clear the
+       * session cookie and every legacy cookie. Each cookie needs its own
+       * Set-Cookie header - joining them into one value is not valid HTTP.
+       */
+      const headers = new Headers();
+
+      for (const cookie of clearGitHubSessionHeaders()) {
+        headers.append('Set-Cookie', cookie);
+      }
+
+      return errorResponse(error, headers);
     }
   }
 

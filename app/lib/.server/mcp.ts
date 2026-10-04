@@ -321,6 +321,39 @@ export function validateServerUrl(value: string): string {
   return url.toString();
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+/**
+ * Validates the authorization URL a remote server (or its `WWW-Authenticate`
+ * header) asks the browser to visit.
+ *
+ * The URL is handed to `window.location`, so a hostile server could otherwise
+ * redirect the browser to `javascript:` (script execution in Bolt's origin) or
+ * to a plain-http page. RFC 8414 requires https for authorization endpoints;
+ * loopback http is allowed so local development and the test suite work.
+ */
+export function assertSafeAuthorizationUrl(value: string): string {
+  let url: URL;
+
+  try {
+    url = new URL(value);
+  } catch {
+    throw new McpError('invalid_request', 'The MCP authorization server returned an invalid authorization URL.');
+  }
+
+  const loopback = url.protocol === 'http:' && LOOPBACK_HOSTS.has(url.hostname);
+
+  if (url.protocol !== 'https:' && !loopback) {
+    throw new McpError(
+      'invalid_request',
+      'The MCP authorization server returned a non-https authorization URL; refusing to redirect the browser there.',
+      'Use an MCP server whose authorization endpoint is served over https.',
+    );
+  }
+
+  return url.toString();
+}
+
 function normalizeToolInfo(toolInfo: { name: string; description?: string; inputSchema?: unknown }): McpToolInfo {
   const inputSchema =
     toolInfo.inputSchema && typeof toolInfo.inputSchema === 'object' && !Array.isArray(toolInfo.inputSchema)

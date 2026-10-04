@@ -495,6 +495,35 @@ describe('MCP OAuth client', () => {
     });
   });
 
+  it('drops the discovery cache instead of failing when the sealed store is too large', async () => {
+    /*
+     * Discovery metadata is re-fetched automatically, tokens are not. Access
+     * tokens are often long JWTs, so the cache is evicted before the flow fails.
+     */
+    const store = {
+      'oauth-server': {
+        serverId: 'oauth-server',
+        serverUrl: 'https://mcp.example.com/mcp',
+        tokens: { access_token: 'access-token-value', token_type: 'Bearer', refresh_token: 'refresh-token-value' },
+        discovery: { authorizationServerMetadata: { issuer: 'y'.repeat(MCP_OAUTH_COOKIE_LIMIT_BYTES - 800) } },
+        updatedAt: new Date().toISOString(),
+      },
+    } as unknown as McpOAuthStore;
+
+    const headers = await oauthStoreHeaders(store, { APP_ENCRYPTION_SECRET: SECRET });
+    const cookie = headers[0];
+
+    expect(cookie).toContain('HttpOnly');
+    expect(store['oauth-server'].discovery).toBeUndefined();
+
+    const request = new Request('https://bolt.example.test/api/mcp', {
+      headers: { Cookie: cookie.split(';')[0] },
+    });
+    const restored = await readOAuthStore(request, { APP_ENCRYPTION_SECRET: SECRET });
+
+    expect(restored['oauth-server'].tokens?.refresh_token).toBe('refresh-token-value');
+  });
+
   it('requires a Worker secret before storing OAuth material and clears the cookie otherwise', async () => {
     expect(() => requireOAuthSecret({})).toThrow(/APP_ENCRYPTION_SECRET/);
 

@@ -4,7 +4,7 @@ import type { ModelInfo } from '~/lib/modules/llm/types';
 import type { IProviderSetting } from '~/types/model';
 
 type WorkersRole = 'system' | 'user' | 'assistant' | 'tool';
-type WorkersMessage = { role: WorkersRole; content: string };
+type WorkersMessage = { role: WorkersRole; content: string; tool_call_id?: string };
 
 type WorkersAiTool = {
   type: 'function';
@@ -72,11 +72,41 @@ function getTextContent(content: unknown): string {
     .join('\n');
 }
 
+/**
+ * Workers AI (like the OpenAI chat schema) expects tool results to reference the
+ * call they answer. Without `tool_call_id` a multi-step tool loop has no way to
+ * associate a result with its call, which models reject or ignore.
+ */
+function getToolCallId(content: unknown): string | undefined {
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+
+  for (const part of content) {
+    if (!part || typeof part !== 'object') {
+      continue;
+    }
+
+    const value = part as Record<string, unknown>;
+
+    if (value.type === 'tool-result' && typeof value.toolCallId === 'string' && value.toolCallId.length > 0) {
+      return value.toolCallId;
+    }
+  }
+
+  return undefined;
+}
+
 function toWorkersMessages(prompt: LanguageModelV1CallOptions['prompt']): WorkersMessage[] {
-  return prompt.map((message) => ({
-    role: message.role,
-    content: getTextContent(message.content),
-  }));
+  return prompt.map((message) => {
+    const toolCallId = getToolCallId(message.content);
+
+    return {
+      role: message.role,
+      content: getTextContent(message.content),
+      ...(toolCallId ? { tool_call_id: toolCallId } : {}),
+    };
+  });
 }
 
 function toWorkersTools(options: LanguageModelV1CallOptions): WorkersAiTool[] | undefined {

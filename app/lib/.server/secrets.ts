@@ -326,10 +326,20 @@ export function isSecureOrigin(request: Request): boolean {
 
 /** Redacts credential-shaped substrings from any string that may reach a log or the UI. */
 export function redactSecrets(value: string): string {
-  return value
-    .replace(/(authorization\s*[:=]\s*(?:bearer|token|basic)\s+)[^\s,;"}]+/gi, '$1[redacted]')
-    .replace(/\b(gh[pousr]_[A-Za-z0-9_-]{10,})/g, '[redacted-github-token]')
-    .replace(/\b(github_pat_[A-Za-z0-9_-]{10,})/g, '[redacted-github-token]')
-    .replace(/((?:access|refresh|id)[_-]?token"?\s*[:=]\s*"?)[^\s,;"}]+/gi, '$1[redacted]')
-    .replace(/((?:api[_-]?key|client[_-]?secret|password|secret)\s*[:=]\s*)[^\s,;"}]+/gi, '$1[redacted]');
+  return (
+    value
+      .replace(/(authorization\s*[:=]\s*(?:bearer|token|basic)\s+)[^\s,;"}]+/gi, '$1[redacted]')
+      .replace(/\b(gh[pousr]_[A-Za-z0-9_-]{10,})/g, '[redacted-github-token]')
+      .replace(/\b(github_pat_[A-Za-z0-9_-]{10,})/g, '[redacted-github-token]')
+
+      /*
+       * Vendor key shapes are redacted even when they appear as a bare value, which
+       * is how providers usually echo them back inside an error message.
+       */
+      .replace(/\b(sk-[A-Za-z0-9_-]{16,})/g, '[redacted-api-key]')
+      .replace(/\b(xox[baprs]-[A-Za-z0-9-]{10,})/g, '[redacted-api-key]')
+      .replace(/\b(AKIA[0-9A-Z]{16})/g, '[redacted-api-key]')
+      .replace(/((?:access|refresh|id)[_-]?token"?\s*[:=]\s*"?)[^\s,;"}]+/gi, '$1[redacted]')
+      .replace(/((?:api[_-]?key|client[_-]?secret|password|secret)\s*[:=]\s*)[^\s,;"}]+/gi, '$1[redacted]')
+  );
 }

@@ -31,6 +31,23 @@ function PermissionRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** A GitHub App installation token is detected on the server; say what it means. */
+function tokenKindLabel(kind: GitHubStatus['tokenKind']): string {
+  if (kind === 'classic') {
+    return 'classic personal access token';
+  }
+
+  if (kind === 'installation') {
+    return 'GitHub App installation token (scopes are not exposed and repositories cannot be created)';
+  }
+
+  if (kind === 'fine_grained') {
+    return 'fine-grained personal access token';
+  }
+
+  return 'unknown (fine-grained or app token; permissions are verified by pushing)';
+}
+
 export default function ConnectionsTab() {
   const [status, setStatus] = useState<GitHubStatus>({ connected: false, storageConfigured: true });
   const [token, setToken] = useState('');
@@ -167,7 +184,7 @@ export default function ConnectionsTab() {
                 Connected as <strong>{status.name ? `${status.name} (${status.login})` : status.login}</strong>
               </span>
             </div>
-            <PermissionRow label="Token kind" value={status.tokenKind ?? 'unknown'} />
+            <PermissionRow label="Token kind" value={tokenKindLabel(status.tokenKind)} />
             <PermissionRow
               label="Scopes"
               value={
@@ -181,7 +198,7 @@ export default function ConnectionsTab() {
                   ? 'allowed'
                   : status.repoCreate === 'unverified'
                     ? 'unverified (fine-grained tokens do not expose this before the first push)'
-                    : 'not permitted'
+                    : 'not permitted — create the repository on GitHub first, or reconnect with a personal token'
               }
             />
             {repoAccess && (

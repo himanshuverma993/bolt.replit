@@ -90,7 +90,7 @@ export class GitHubError extends Error {
   }
 }
 
-export type GitHubTokenKind = 'classic' | 'fine_grained' | 'unknown';
+export type GitHubTokenKind = 'classic' | 'fine_grained' | 'installation' | 'unknown';
 
 export type GitHubRepoAccess = {
   repository: string;
@@ -300,6 +300,19 @@ export function classifyGitHubError(error: unknown): GitHubError {
       );
     }
 
+    /*
+     * GitHub answers `422 Reference already exists` when a branch shows up while
+     * the first commit is being written; that is a retryable conflict, not a
+     * permission problem, so it must be checked before the repository-name case.
+     */
+    if (/reference|ref\b/i.test(message) && /already[_ ]?exists/i.test(message)) {
+      return new GitHubError(
+        'branch_conflict',
+        'The branch already exists on GitHub (HTTP 422).',
+        'Bolt rebases the push on the existing branch head and retries.',
+      );
+    }
+
     if (/already exists/i.test(message)) {
       return new GitHubError(
         'insufficient_permissions',
@@ -383,6 +396,50 @@ function determineTokenKind(scopes: string[]): GitHubTokenKind {
   return 'unknown';
 }
 
+type InstallationProbe = {
+  installation: boolean;
+  permissions?: Record<string, string>;
+};
+
+/**
+ * GitHub App installation tokens expose neither `x-oauth-scopes` nor fine-grained
+ * permissions, so they look identical to a scope-less personal token. The only
+ * reliable discriminator is `GET /user/installations`, which returns 200 for an
+ * installation token and 403 for everything else.
+ *
+ * This matters for the UI and for the push hint: an installation token can never
+ * create a repository, no matter which permissions the app was granted.
+ */
+async function probeInstallationToken(octokit: OctokitLike, login: string): Promise<InstallationProbe> {
+  try {
+    const installations = await octokit.request('GET /user/installations');
+    const list = installations.data.installations ?? [];
+    const accountLogin = (item: (typeof list)[number]): string | undefined => {
+      const account = item.account;
+
+      if (!account) {
+        return undefined;
+      }
+
+      return 'login' in account ? account.login : account.slug;
+    };
+    const match =
+      list.find((item) => accountLogin(item)?.toLowerCase() === login.toLowerCase()) ?? list[0] ?? undefined;
+
+    if (!match) {
+      return { installation: false };
+    }
+
+    return {
+      installation: true,
+      permissions: (match.permissions ?? {}) as Record<string, string>,
+    };
+  } catch {
+    // Not an installation token (fine-grained PATs, OAuth apps: 403/404 here).
+    return { installation: false };
+  }
+}
+
 /**
  * Verifies identity and the permissions the push flow needs.
  *
@@ -420,14 +477,40 @@ export async function verifyGitHubToken(options: {
   }
 
   const scopes = parseScopes(userResponse.headers['x-oauth-scopes'] as string | undefined);
-  const tokenKind = determineTokenKind(scopes);
+  let tokenKind = determineTokenKind(scopes);
+  let installationPermissions: Record<string, string> | undefined;
+
+  if (tokenKind === 'unknown') {
+    const probe = await probeInstallationToken(octokit, login);
+
+    if (probe.installation) {
+      tokenKind = 'installation';
+      installationPermissions = probe.permissions;
+    }
+  }
+
+  let repoCreate: GitHubConnection['repoCreate'];
+
+  if (tokenKind === 'installation') {
+    /*
+     * GitHub Apps create repositories through `POST /user/repos` only when the
+     * installation carries `administration: write`; anything else is refused by
+     * GitHub itself ("Resource not accessible by integration").
+     */
+    repoCreate = installationPermissions?.administration === 'write' ? 'unverified' : 'not_allowed';
+  } else if (tokenKind === 'classic') {
+    repoCreate = scopes.includes('repo') ? 'allowed' : 'unverified';
+  } else {
+    repoCreate = 'unverified';
+  }
+
   const connection: GitHubConnection = {
     login,
     name: userResponse.data.name ?? null,
     avatarUrl: userResponse.data.avatar_url ?? null,
     scopes,
     tokenKind,
-    repoCreate: tokenKind === 'classic' ? (scopes.includes('repo') ? 'allowed' : 'unverified') : 'unverified',
+    repoCreate,
     verifiedAt: new Date().toISOString(),
   };
 
@@ -630,7 +713,28 @@ export async function pushProjectToGitHub(options: {
   const isEmptyBySize = typeof repoData.size === 'number' && repoData.size === 0;
   const hasDefaultBranch = typeof repoData.default_branch === 'string' && repoData.default_branch.length > 0;
 
-  const createInitialCommit = async (): Promise<string> => {
+  const buildResult = (commitSha: string, emptyRepository: boolean): GitHubPushResult => ({
+    owner,
+    repo,
+    htmlUrl: `https://github.com/${fullName}`,
+    branch: targetBranch,
+    commitSha,
+    created,
+    emptyRepository,
+    filesWritten: pushable.length,
+    filesSkipped: skipped.length,
+    skippedPaths: skipped,
+  });
+
+  /**
+   * Writes the first commit of a repository that has no branch yet.
+   *
+   * `refCreated: false` means the branch appeared while we were working (or the
+   * repository was not empty after all): the caller must take the update path,
+   * otherwise the commit we just created would stay unreachable and the push
+   * would silently lose every file.
+   */
+  const createInitialCommit = async (): Promise<{ sha: string; refCreated: boolean }> => {
     const tree = await octokit.git.createTree({ owner, repo, tree: treeEntries });
     const commit = await octokit.git.createCommit({
       owner,
@@ -642,36 +746,25 @@ export async function pushProjectToGitHub(options: {
 
     try {
       await octokit.git.createRef({ owner, repo, ref: `refs/heads/${targetBranch}`, sha: commit.data.sha });
+
+      return { sha: commit.data.sha, refCreated: true };
     } catch (error) {
       const classified = classifyGitHubError(error);
 
-      /*
-       * The branch appeared between our checks (for example a second push):
-       * fall through to the normal update path instead of failing.
-       */
-      if (classified.code !== 'invalid_request' && classified.code !== 'branch_conflict') {
-        throw classified;
+      if (classified.code === 'invalid_request' || classified.code === 'branch_conflict') {
+        return { sha: commit.data.sha, refCreated: false };
       }
-    }
 
-    return commit.data.sha;
+      throw classified;
+    }
   };
 
   if (isEmptyBySize || !hasDefaultBranch) {
-    const commitSha = await createInitialCommit();
+    const initial = await createInitialCommit();
 
-    return {
-      owner,
-      repo,
-      htmlUrl: `https://github.com/${fullName}`,
-      branch: targetBranch,
-      commitSha,
-      created,
-      emptyRepository: true,
-      filesWritten: pushable.length,
-      filesSkipped: skipped.length,
-      skippedPaths: skipped,
-    };
+    if (initial.refCreated) {
+      return buildResult(initial.sha, true);
+    }
   }
 
   const maxAttempts = 3;
@@ -685,29 +778,20 @@ export async function pushProjectToGitHub(options: {
     } catch (error) {
       const classified = classifyGitHubError(error);
 
-      if (classified.code === 'repo_empty') {
-        const commitSha = await createInitialCommit();
+      if (classified.code === 'repo_empty' || classified.code === 'repo_not_found') {
+        /*
+         * Either GitHub says the repository is empty, or the branch does not
+         * exist yet (an empty repository still reports a default branch name).
+         * Try to write the first commit; if the branch shows up meanwhile the
+         * loop re-reads it instead of failing.
+         */
+        const initial = await createInitialCommit();
 
-        return {
-          owner,
-          repo,
-          htmlUrl: `https://github.com/${fullName}`,
-          branch: targetBranch,
-          commitSha,
-          created,
-          emptyRepository: true,
-          filesWritten: pushable.length,
-          filesSkipped: skipped.length,
-          skippedPaths: skipped,
-        };
-      }
+        if (initial.refCreated) {
+          return buildResult(initial.sha, true);
+        }
 
-      if (classified.code === 'repo_not_found') {
-        throw new GitHubError(
-          'missing_default_branch',
-          `The repository has no branch named "${targetBranch}".`,
-          `Push to an existing branch or let Bolt create "${targetBranch}".`,
-        );
+        continue;
       }
 
       throw classified;
@@ -736,18 +820,7 @@ export async function pushProjectToGitHub(options: {
         force: false,
       });
 
-      return {
-        owner,
-        repo,
-        htmlUrl: `https://github.com/${fullName}`,
-        branch: targetBranch,
-        commitSha: commit.data.sha,
-        created,
-        emptyRepository: false,
-        filesWritten: pushable.length,
-        filesSkipped: skipped.length,
-        skippedPaths: skipped,
-      };
+      return buildResult(commit.data.sha, false);
     } catch (error) {
       const classified = classifyGitHubError(error);
 

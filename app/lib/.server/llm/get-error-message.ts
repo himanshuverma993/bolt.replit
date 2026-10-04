@@ -6,11 +6,22 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 function redactSensitiveValues(value: string): string {
-  return value
-    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,}]+/gi, '$1[redacted]')
-    .replace(/(api[_ -]?key\s*[:=]\s*)[^\s,}]+/gi, '$1[redacted]')
-    .replace(/(token\s*[:=]\s*)[^\s,}]+/gi, '$1[redacted]')
-    .replace(/(secret\s*[:=]\s*)[^\s,}]+/gi, '$1[redacted]');
+  return (
+    value
+      .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,}]+/gi, '$1[redacted]')
+      .replace(/(api[_ -]?key\s*[:=]\s*)[^\s,}]+/gi, '$1[redacted]')
+      .replace(/(token\s*[:=]\s*)[^\s,}]+/gi, '$1[redacted]')
+      .replace(/(secret\s*[:=]\s*)[^\s,}]+/gi, '$1[redacted]')
+
+      /*
+       * Bare credential shapes. Providers sometimes echo the key they rejected
+       * without any `key=` prefix, and that value must never reach the browser or
+       * the Worker log.
+       */
+      .replace(/\b(sk-[A-Za-z0-9_-]{16,})/g, '[redacted-api-key]')
+      .replace(/\b(gh[pousr]_[A-Za-z0-9_-]{10,})/g, '[redacted-github-token]')
+      .replace(/\b(github_pat_[A-Za-z0-9_-]{10,})/g, '[redacted-github-token]')
+  );
 }
 
 function truncate(value: string): string {

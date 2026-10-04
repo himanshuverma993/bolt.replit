@@ -443,4 +443,25 @@ describe('MCP Streamable HTTP client', () => {
     expect(() => validateServerUrl('https://example.com/mcp?token=abc')).toThrow(/query string/);
     expect(validateServerUrl('https://mcp.example.com/mcp')).toBe('https://mcp.example.com/mcp');
   });
+
+  it('only allows https (or loopback http) authorization URLs to reach the browser', async () => {
+    const { assertSafeAuthorizationUrl } = await import('./mcp');
+
+    expect(assertSafeAuthorizationUrl('https://auth.example.com/authorize?client_id=x')).toBe(
+      'https://auth.example.com/authorize?client_id=x',
+    );
+    expect(assertSafeAuthorizationUrl('http://127.0.0.1:8080/authorize')).toBe('http://127.0.0.1:8080/authorize');
+    expect(assertSafeAuthorizationUrl('http://localhost:9876/authorize')).toBe('http://localhost:9876/authorize');
+
+    // Everything else would be handed to window.location and must be refused.
+    for (const unsafe of [
+      'javascript:alert(document.cookie)',
+      'data:text/html,<script>alert(1)</script>',
+      'http://evil.example/authorize',
+      'not a url',
+      'file:///etc/passwd',
+    ]) {
+      expect(() => assertSafeAuthorizationUrl(unsafe)).toThrow(/authorization URL/);
+    }
+  });
 });

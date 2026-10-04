@@ -118,6 +118,103 @@ describe('CloudflareProvider', () => {
     expect(result.toolCalls?.[0]).toMatchObject({ toolName: 'lookup', args: '{"query":"status"}' });
   });
 
+  it('sends tool results with their tool_call_id and keeps tool definitions when tools are offered', async () => {
+    const provider = new CloudflareProvider();
+    let capturedInput: Record<string, unknown> | undefined;
+    const run = async (_model: string, input: Record<string, unknown>) => {
+      capturedInput = input;
+
+      return { response: 'done' };
+    };
+    const model = provider.getModelInstance({
+      model: provider.staticModels[0].name,
+      serverEnv: { AI: { run } } as unknown as Env,
+    });
+
+    await model.doGenerate(
+      makeOptions({
+        prompt: [
+          { role: 'system', content: 'You are a test assistant.' },
+          { role: 'user', content: [{ type: 'text', text: 'Check the status.' }] },
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool-call',
+                toolCallId: 'call-1',
+                toolName: 'lookup',
+                args: '{"query":"status"}',
+              },
+            ],
+          },
+          {
+            role: 'tool',
+            content: [
+              {
+                type: 'tool-result',
+                toolCallId: 'call-1',
+                toolName: 'lookup',
+                result: { ok: true },
+              },
+            ],
+          },
+        ],
+        mode: {
+          type: 'regular',
+          tools: [
+            {
+              type: 'function',
+              name: 'lookup',
+              description: 'Look up a status.',
+              parameters: { type: 'object', properties: {} },
+            },
+          ],
+          toolChoice: { type: 'auto' },
+        },
+      }),
+    );
+
+    const messages = capturedInput?.messages as Array<Record<string, unknown>>;
+
+    expect(messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'call-1' });
+    expect(String(messages.at(-1)?.content)).toContain('Tool result');
+    expect(messages[0]).not.toHaveProperty('tool_call_id');
+    expect(capturedInput?.tools).toHaveLength(1);
+  });
+
+  it('omits tool definitions when toolChoice is none (no MCP servers configured)', async () => {
+    const provider = new CloudflareProvider();
+    let capturedInput: Record<string, unknown> | undefined;
+    const run = async (_model: string, input: Record<string, unknown>) => {
+      capturedInput = input;
+
+      return { response: 'ok' };
+    };
+    const model = provider.getModelInstance({
+      model: provider.staticModels[0].name,
+      serverEnv: { AI: { run } } as unknown as Env,
+    });
+
+    await model.doGenerate(
+      makeOptions({
+        mode: {
+          type: 'regular',
+          tools: [
+            {
+              type: 'function',
+              name: 'lookup',
+              description: 'Look up a status.',
+              parameters: { type: 'object', properties: {} },
+            },
+          ],
+          toolChoice: { type: 'none' },
+        },
+      }),
+    );
+
+    expect(capturedInput).not.toHaveProperty('tools');
+  });
+
   it('exposes the v1 model contract', () => {
     const provider = new CloudflareProvider();
     const model: LanguageModelV1 = provider.getModelInstance({

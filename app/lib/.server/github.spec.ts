@@ -21,6 +21,8 @@ import {
  */
 
 type MockOptions = {
+  installations?: Array<{ account: string; permissions: Record<string, string> }>;
+  createRefStatus?: number;
   login?: string;
   scopes?: string;
   userStatus?: number;
@@ -85,6 +87,8 @@ function readBody(request: IncomingMessage): Promise<string> {
 
 async function startGitHubMock(options: MockOptions = {}): Promise<string> {
   const settings: Required<Omit<MockOptions, 'refBody'>> & { refBody?: unknown } = {
+    installations: options.installations ?? [],
+    createRefStatus: options.createRefStatus ?? 201,
     login: options.login ?? 'octocat',
     scopes: options.scopes ?? 'repo',
     userStatus: options.userStatus ?? 200,
@@ -138,6 +142,20 @@ async function startGitHubMock(options: MockOptions = {}): Promise<string> {
         size: settings.repoSize,
         default_branch: settings.defaultBranch,
         permissions: settings.permissions,
+      });
+    }
+
+    if (path === '/user/installations' && request.method === 'GET') {
+      if (settings.installations.length === 0) {
+        return json(response, 403, { message: 'Resource not accessible by integration' });
+      }
+
+      return json(response, 200, {
+        installations: settings.installations.map((installation, index) => ({
+          id: 1000 + index,
+          account: { login: installation.account },
+          permissions: installation.permissions,
+        })),
       });
     }
 
@@ -197,6 +215,10 @@ async function startGitHubMock(options: MockOptions = {}): Promise<string> {
 
     if (/^\/repos\/[^/]+\/[^/]+\/git\/refs$/.test(path) && request.method === 'POST') {
       state.createRefCalls += 1;
+
+      if (settings.createRefStatus >= 400) {
+        return json(response, settings.createRefStatus, { message: 'Reference already exists' });
+      }
 
       return json(response, 201, { ref: 'refs/heads/main' });
     }
@@ -297,6 +319,29 @@ describe('GitHub connection verification', () => {
     await expect(
       verifyGitHubToken({ token: 'test-token', expectedLogin: 'someone-else', octokit: clientFor(baseUrl) }),
     ).rejects.toMatchObject({ code: 'invalid_request' });
+  });
+
+  it('detects a GitHub App installation token and reports that repositories cannot be created', async () => {
+    const baseUrl = await startGitHubMock({
+      scopes: '',
+      installations: [{ account: 'octocat', permissions: { contents: 'write', metadata: 'read' } }],
+    });
+    const connection = await verifyGitHubToken({ token: 'app-token', octokit: clientFor(baseUrl, 'app-token') });
+
+    expect(connection.tokenKind).toBe('installation');
+    expect(connection.scopes).toEqual([]);
+    expect(connection.repoCreate).toBe('not_allowed');
+  });
+
+  it('keeps repository creation unverified for an installation that carries administration write', async () => {
+    const baseUrl = await startGitHubMock({
+      scopes: '',
+      installations: [{ account: 'octocat', permissions: { contents: 'write', administration: 'write' } }],
+    });
+    const connection = await verifyGitHubToken({ token: 'app-token', octokit: clientFor(baseUrl, 'app-token') });
+
+    expect(connection.tokenKind).toBe('installation');
+    expect(connection.repoCreate).toBe('unverified');
   });
 });
 
@@ -429,6 +474,39 @@ describe('GitHub push flow', () => {
         octokit: clientFor(baseUrl),
       }),
     ).rejects.toBeInstanceOf(GitHubError);
+  });
+
+  it('updates the branch instead of losing the commit when a repository reports size 0 but already has a branch', async () => {
+    /*
+     * GitHub reports size 0 for some repositories that do have commits; the branch
+     * then already exists and createRef fails. The commit must not be orphaned.
+     */
+    const baseUrl = await startGitHubMock({ repoSize: 0, createRefStatus: 422 });
+    const result = await pushProjectToGitHub({
+      token: 'test-token',
+      owner: 'octocat',
+      repoName: 'thin-repo',
+      files,
+      octokit: clientFor(baseUrl),
+    });
+
+    expect(state.createRefCalls).toBe(1);
+    expect(state.updateRefCalls).toBe(1);
+    expect(result).toMatchObject({ emptyRepository: false, commitSha: 'commit-2', filesWritten: 2 });
+  });
+
+  it('writes the first commit when the branch does not exist yet (404 on the ref)', async () => {
+    const baseUrl = await startGitHubMock({ repoSize: 128, refStatus: 404 });
+    const result = await pushProjectToGitHub({
+      token: 'test-token',
+      owner: 'octocat',
+      repoName: 'no-ref-yet',
+      files,
+      octokit: clientFor(baseUrl),
+    });
+
+    expect(state.createRefCalls).toBe(1);
+    expect(result).toMatchObject({ emptyRepository: true, filesWritten: 2 });
   });
 });
 

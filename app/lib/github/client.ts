@@ -37,7 +37,7 @@ export type GitHubConnection = {
   name: string | null;
   avatarUrl: string | null;
   scopes: string[];
-  tokenKind: 'classic' | 'fine_grained' | 'unknown';
+  tokenKind: 'classic' | 'fine_grained' | 'installation' | 'unknown';
   repoCreate: 'allowed' | 'not_allowed' | 'unverified';
   repoAccess?: GitHubRepoAccess;
   verifiedAt: string;
