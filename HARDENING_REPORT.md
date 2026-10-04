@@ -980,6 +980,36 @@ de-duplicated tokens, OpenAI-only text, truncated flush, and the full `streamTex
 plus the fatal grep were behaviour-tested against canned streams for a successful call, a tool-level error with and
 without arguments, a remote-call failure and a healthy stream.
 
+### 12.3i Resolution: the loop is verified end to end on production
+
+PR #6 (`f027ca2`) was merged as `16efbff`, and the post-merge run `37220542477` on `main` passed with all eleven
+executed steps green and the deployment confirmed current:
+
+```
+[notice] live bundle embeds 16efbff, the current main tip - the deployment is built from that revision
+[notice] production streamed a tool call with arguments
+         (text=2 toolCall=1 toolResult=1 args={"query":"Workers AI"}
+          result={"server":"cf-docs-tools","tool":"search_cloudflare_documentation","risk":"read",
+                  "result":"[MCP tool output exceeded the 16384-byte limit and was truncated]"})
+[notice] production executed an MCP tool inside a Workers AI chat (…)
+[notice] the tools-enabled chat answered TOOLS_OK, so the MCP tool list reached the model (…)
+```
+
+This is the first time all four properties hold at once on the merged revision:
+
+1. the deployed bundle embeds the merged commit (no stale-deployment ambiguity);
+2. the streamed tool call carries the arguments the prompt asked for (`{"query":"Workers AI"}`), so the marker bug is
+   gone in production;
+3. the remote MCP tool really executed and returned content - and the **16 KiB output cap** is exercised live for the
+   first time (it was previously covered only by the Node unit test), truncating a real oversized result;
+4. the model received the tool result and answered `TOOLS_OK`, so the whole loop closes.
+
+The branch-only security probes (they mutate connection state, so they are skipped on production runs by design) were
+green on the branch run at the same tree (`37220260144`): OAuth client metadata served, forged OAuth callback rejected
+with `missing_state_cookie`, OAuth-only server refused and classified `auth_required / http_401`, real remote server
+connected with two discovered tools, GitHub token storage failing closed without a Worker secret (HTTP 501) without
+echoing the token, and the preview deployment reporting the missing Workers AI binding explicitly.
+
 ### 12.4 Commits and live runs of this pass
 
 | Commit | Subject |
@@ -1012,3 +1042,20 @@ Also corrected in this pass: the PR body was being updated through `gh pr edit`,
 repository with a GraphQL `Projects (classic)` deprecation error while still exiting non-zero, so the body had
 silently stayed at an older revision. It is now written through the REST API
 (`gh api -X PATCH repos/.../pulls/3 --input <body>.json`) and the live body contains the third-pass section.
+
+### 12.4b The tool-loop hardening pass (PR #3 → PR #6)
+
+| PR | Squash | Live evidence |
+| --- | --- | --- |
+| #3 | `8465e2e` | run `37214883586`…`37216087609` green; run `37216579930` failed on the deploy race |
+| #4 | `313c995` | `fix(ci): stop the tools-enabled chat step from racing the production deploy`; live-probe run `37217101723` green at `329d856` |
+| #5 | `46f244b` | gate on stream health instead of the model's wording; probe the tool-capable model; first adapter fix for fragmented tool-call arguments |
+| — | `313c995` | post-merge run `37217339645` FAILED: the step gated on the model's literal wording |
+| — | `46f244b` | post-merge run `37219417737` FAILED: `9:{…"args":{}}` - the adapter still emitted empty arguments while the deploy-freshness wait proved the revision was current |
+| #6 | `16efbff` | post-merge run `37220542477` **green**: arguments streamed, the MCP tool executed, the 16 KiB cap truncated a real result, and the model answered `TOOLS_OK` |
+
+Repeated process facts worth keeping: a squashed PR makes every later PR show the whole tree until the branch is reset
+to `origin/main` and the new commits are cherry-picked (`changedFiles` drops to the real diff, and the merge API then
+reports `MERGEABLE`); the merge endpoint requires a full 40-character SHA; run logs are unreachable from this
+environment, so every diagnostic lives in `::notice::`/`::warning::`/`::error::` annotations; and `gh workflow run`
+is not permitted here, so only a push or a merge can trigger the live verification.
