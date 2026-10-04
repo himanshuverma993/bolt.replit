@@ -28,8 +28,28 @@ jobs:
       - name: Resolve target
         id: target
         run: |
-          set -euo pipefail
-          BASE="${{ github.event.inputs.base_url || 'https://bolt-replit.biharzone37.workers.dev' }}"
+          set -uo pipefail
+          DEFAULT="https://bolt-replit.biharzone37.workers.dev"
+          BASE="${{ github.event.inputs.base_url || '' }}"
+          if [ -z "$BASE" ]; then
+            BASE="$DEFAULT"
+            if [ "${{ github.ref_name }}" != "main" ]; then
+              # Cloudflare Workers Builds publishes a preview deployment for the pushed
+              # branch; probe it first so a branch is verified before it reaches main.
+              slug=$(echo "${{ github.ref_name }}" | tr '/' '-' | tr -cd 'a-z0-9-' | cut -c1-40)
+              for candidate in \
+                "https://${slug}-bolt-replit.biharzone37.workers.dev" \
+                "https://${slug}.biharzone37.workers.dev" \
+                "https://bolt-replit-${slug}.biharzone37.workers.dev"; do
+                page=$(curl -sS --max-time 15 "$candidate/" 2>/dev/null | head -c 4000 || true)
+                if echo "$page" | grep -qi '<title>Bolt</title>'; then
+                  BASE="$candidate"
+                  echo "::notice::probing the branch preview deployment at $candidate"
+                  break
+                fi
+              done
+            fi
+          fi
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "Probing $BASE"
 
