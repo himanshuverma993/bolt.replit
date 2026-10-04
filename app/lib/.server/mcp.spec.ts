@@ -1,3 +1,4 @@
+import { CfWorkerJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/cfworker';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -454,6 +455,31 @@ describe('MCP Streamable HTTP client', () => {
     expect(validateServerUrl('http://[fd00::1]:8931/mcp')).toBe('http://[fd00::1]:8931/mcp');
     expect(() => validateServerUrl('http://example.com/mcp')).toThrow(/https/);
     expect(() => validateServerUrl('http://8.8.8.8/mcp')).toThrow(/https/);
+  });
+
+  it('configures the MCP client with the workerd-safe JSON Schema validator', async () => {
+    const { mcpClientOptions } = await import('./mcp');
+    const validator = mcpClientOptions().jsonSchemaValidator;
+
+    /*
+     * The SDK defaults to Ajv, which compiles schemas with `new Function`.
+     * workerd forbids dynamic code generation, so listing tools from a server
+     * that publishes an `outputSchema` failed with "Code generation from strings
+     * disallowed for this context" until this validator was wired in.
+     */
+    expect(validator).toBeInstanceOf(CfWorkerJsonSchemaValidator);
+
+    if (!validator) {
+      throw new Error('the MCP client has no JSON Schema validator configured');
+    }
+
+    const validate = validator.getValidator({
+      type: 'object',
+      properties: { title: { type: 'string' } },
+    } as Parameters<typeof validator.getValidator>[0]);
+
+    expect(validate({ title: 'ok' }).valid).toBe(true);
+    expect(validate({ title: 42 }).valid).toBe(false);
   });
 
   it('only allows https (or loopback http) authorization URLs to reach the browser', async () => {

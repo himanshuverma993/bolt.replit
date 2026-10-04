@@ -25,3 +25,10 @@ jobs:
 
       - name: Run tests
         run: pnpm run test
+
+      # Node allows `new Function`/`eval`; workerd does not. This smoke test runs
+      # the built Worker in local workerd and connects it to a mock MCP server
+      # whose tool publishes an `outputSchema`, which is the path that used to fail
+      # with "Code generation from strings disallowed for this context".
+      - name: Workers runtime smoke test (MCP connect under workerd)
+        run: node scripts/ci/workers-runtime-smoke.mjs

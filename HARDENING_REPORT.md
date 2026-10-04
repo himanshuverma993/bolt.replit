@@ -620,14 +620,48 @@ missing callback URI) exits non-zero. The workflow YAML parses with `js-yaml` (1
 * **No-MCP chat** - `toolChoice: 'none'` path asserted in `cloudflare.spec.ts` and the live production chat probe
   (no tools configured).
 
+### 11.5 Production-only defect found by the new live step (MCP + workerd)
+
+The new "real remote MCP server" step first reported:
+
+```
+[warning] the remote MCP failure was only classified as unknown :: MCP connection failed: Code generation from strings disallowed for this context
+```
+
+That message is *our* bug, not a refusal by the remote server. Reproduced locally in the real runtime
+(`npx wrangler dev` with a temporary config that omits the `[ai]` binding, plus a mock MCP server whose tool
+publishes an `outputSchema`):
+
+| Runtime | Result |
+| --- | --- |
+| Node (unit tests) | connected, because Node allows `new Function` |
+| workerd, before the fix | `status=error`, `statusCode=unknown`, `MCP connection failed: Code generation from strings disallowed for this context` |
+| workerd, after the fix | `status=connected`, `tools=get_page` (risk `read`) |
+
+Root cause: `@modelcontextprotocol/sdk@1.32.0` constructs its `Client` with `AjvJsonSchemaValidator` by
+default, and Ajv compiles every JSON Schema with `new Function`. On `tools/list` the client builds a validator
+for each tool that has an `outputSchema` (SDK `client/index.js:535`), which workerd refuses. Fix: the SDK ships
+a codegen-free validator, so the client is now created with
+`CfWorkerJsonSchemaValidator` from `@cfworker/json-schema` (new pinned dependency `4.1.1`); see
+`mcpClientOptions()` in `app/lib/.server/mcp.ts` and the unit test that asserts the wiring.
+
+Durable guard: `scripts/ci/workers-runtime-smoke.mjs` boots the built Worker in local workerd, connects it to a
+mock MCP server, and asserts `connected` plus the discovered tool. It is wired into `.github/workflows/ci.yaml`
+and was proved to have teeth: with the fix removed it exits 1 with
+`the Worker could not connect to the mock MCP server: status=error code=unknown message=MCP connection failed: Code generation from strings disallowed for this context`;
+with the fix it exits 0 (`status=connected tools=get_page`). Because the unit suite runs on Node, only a
+workerd-based check can catch this class of defect.
+
 ### 11.4 Blocked or unverified in this environment (unchanged, now restated)
 
 * The disposable-repository write flow (fine-grained PAT with Contents + Administration) - §10.1 has the
   closing command.
 * Live Cloudflare / Figma MCP authorization (interactive browser OAuth, Figma MCP-capable plan).
-* A browser/dev-server run of the UI: `remix vite:dev` cannot start here because `wrangler.toml` sets
-  `[ai] remote = true`, so the Remix dev proxy needs a `CLOUDFLARE_API_TOKEN` that this sandbox does not have.
-  There is no browser in the sandbox either, so UI interaction (Settings → Connection tabs) remains verified by
-  code review, unit tests and the live HTTP probes rather than by clicking.
+* A browser run of the UI: there is no browser in the sandbox, so UI interaction (Settings → Connection tabs)
+  remains verified by code review, unit tests and HTTP probes rather than by clicking. The *Remix dev server*
+  additionally cannot start here because `wrangler.toml` sets `[ai] remote = true`, which needs a
+  `CLOUDFLARE_API_TOKEN`. Route-level behaviour **can** be exercised in the real runtime without an account
+  (`wrangler dev` with a config that omits `[ai]`, as the new smoke test does), and that is how the MCP connect
+  defect above was reproduced and fixed.
 * Live Workers AI **tool looping** (needs a deployment that carries both `env.AI` and this branch).
 * `wrangler secret put APP_ENCRYPTION_SECRET`, and the 53 pre-existing dependency advisories.

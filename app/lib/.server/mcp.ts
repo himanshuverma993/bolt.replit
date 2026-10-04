@@ -23,8 +23,9 @@
  * output, 3 tool-loop steps, 12 KiB of public server state.
  */
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { Client, type ClientOptions } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { CfWorkerJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/cfworker';
 import { jsonSchema, tool, type CoreTool } from 'ai';
 import {
   clearCookie,
@@ -649,7 +650,7 @@ async function withMcpClient<T>(
   }
 
   const transport = new StreamableHTTPClientTransport(new URL(server.url), transportOptions);
-  const client = new Client({ name: 'bolt-replit', version: '0.0.3' });
+  const client = new Client({ name: 'bolt-replit', version: '0.0.3' }, mcpClientOptions());
 
   try {
     await withTimeout(
@@ -661,6 +662,20 @@ async function withMcpClient<T>(
   } finally {
     await client.close().catch(() => undefined);
   }
+}
+
+/**
+ * Client options for the MCP SDK on Cloudflare Workers.
+ *
+ * The SDK defaults to `AjvJsonSchemaValidator`, which compiles JSON Schemas with
+ * `new Function`. workerd forbids dynamic code generation ("Code generation from
+ * strings disallowed for this context"), so any remote server that publishes an
+ * `outputSchema` made the whole tools/list fail. The SDK ships a
+ * `@cfworker/json-schema` provider that validates without code generation, which
+ * is what Workers requires.
+ */
+export function mcpClientOptions(): ClientOptions {
+  return { jsonSchemaValidator: new CfWorkerJsonSchemaValidator() };
 }
 
 export async function discoverMcpTools(
