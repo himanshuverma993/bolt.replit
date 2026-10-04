@@ -937,6 +937,49 @@ Evidence:
   annotations prove the fix end to end; the parser was behaviour-tested against six canned streams
   (tool call with args, fragment-only frames, empty stream, error frame, plain answer, confabulated text).
 
+### 12.3h Second iteration: the marker frames, not the fragments, were the bug
+
+The first post-merge `main` run (`37219417737`) failed in step 11 with the same shape:
+
+```
+the tools-enabled chat reported an MCP or Workers AI failure ::
+9:{"toolCallId":"cloudflare-tool-0","toolName":"mcp_cf-docs-tools_search_cloudflare_documentation","args":{}}|a:{...result...}
+```
+
+That run's deploy-freshness wait passed - it warns and exits when production does not serve the pushed commit, and no
+such warning was emitted - and `__COMMIT_HASH` is `git rev-parse --short HEAD` baked into the served bundle by
+`vite.config.ts`, so production really was running the fixed adapter and `args: {}` was still coming out of it.
+
+That narrowed the remaining holes to the ones the vendor stream actually has:
+
+* a call can open with a **marker** - `arguments: ""`, `arguments: "{}"` (a *string* containing `{}`) or an empty
+  object `{}` - before the real arguments arrive. The first version emitted as soon as the accumulated text parsed as
+  JSON, so `"{}"` and an empty object both produced an immediate call with `{}`, and every later fragment was dropped;
+* a **native** `tool_calls` entry with no arguments can be the opening frame of a streamed call, but it was emitted
+  immediately too and therefore also swallowed the fragments that followed.
+
+Both are fixed:
+
+* streamed fragments are **never** emitted early. They accumulate until the stream ends and are emitted once, before
+  `finish` (the AI SDK executes tools after the step, so nothing is lost);
+* a native entry is emitted immediately only when it already carries meaningful arguments (`{}` and `""` do not
+  count); an argument-less native entry stays pending so later fragments can complete it, and is still surfaced with
+  `{}` if none ever arrive;
+* the `"{}"` marker is cleared before the next fragment is appended.
+
+The gate was corrected as well. Only the app's own wiring messages (`MCP connection failed`, `MCP tools/list failed`,
+`MCP tools/call failed`, `binding is unavailable`) and a remote call that never completed
+(`MCP tool X failed on <server> [code]`) are fatal. A tool that *answered* with an error is a tool-level outcome and
+is reported as a warning together with the arguments that were sent and the first 400 characters of the result, so the
+annotations distinguish a wiring bug from model behaviour without guessing. The tools probe prompt now names the tool
+and its query explicitly, which makes the arguments path the thing under test rather than the model's guesswork.
+
+Evidence: `cloudflare-tool-arguments.spec.ts` is now eleven cases (three marker shapes, a native argument-less call
+completed by fragments, a call that never receives arguments, immediate emission for complete native calls,
+de-duplicated tokens, OpenAI-only text, truncated flush, and the full `streamText` loop), and the two node snippets
+plus the fatal grep were behaviour-tested against canned streams for a successful call, a tool-level error with and
+without arguments, a remote-call failure and a healthy stream.
+
 ### 12.4 Commits and live runs of this pass
 
 | Commit | Subject |

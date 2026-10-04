@@ -105,11 +105,9 @@ describe('CloudflareProvider streamed tool-call fragments', () => {
     expect(parts[parts.length - 1]).toMatchObject({ type: 'finish', finishReason: 'tool-calls' });
   });
 
-  it('emits the call as soon as the arguments are complete, not only at the end', async () => {
+  it('defers a streamed call to the end of the step, still before the finish part', async () => {
     const model = modelWithStream([
       ...fragmentedCall,
-
-      // A later text chunk must arrive after the call, proving it was not deferred.
       JSON.stringify({ response: 'Done.', usage: { prompt_tokens: 11, completion_tokens: 7 } }),
     ]);
 
@@ -117,9 +115,86 @@ describe('CloudflareProvider streamed tool-call fragments', () => {
 
     expect(parts.filter((part) => part.type === 'tool-call')).toHaveLength(1);
     expect(parts.findIndex((part) => part.type === 'tool-call')).toBeLessThan(
-      parts.findIndex((part) => part.type === 'text-delta'),
+      parts.findIndex((part) => part.type === 'finish'),
     );
     expect(parts[parts.length - 1]).toMatchObject({ usage: { promptTokens: 11, completionTokens: 7 } });
+  });
+
+  it('keeps accumulating when the arguments open with an empty JSON object marker', async () => {
+    const model = modelWithStream([
+      deltaFrame({ index: 0, function: { name: 'search_cloudflare_documentation', arguments: '{}' } }),
+      deltaFrame({ index: 0, function: { arguments: '{"que' } }),
+      deltaFrame({ index: 0, function: { arguments: 'ry":"Workers AI"}' } }),
+    ]);
+
+    const parts = (await readStream((await model.doStream(makeOptions())).stream)) as Array<Record<string, unknown>>;
+
+    expect(parts.filter((part) => part.type === 'tool-call')).toEqual([
+      {
+        type: 'tool-call',
+        toolCallType: 'function',
+        toolCallId: 'cloudflare-tool-0',
+        toolName: 'search_cloudflare_documentation',
+        args: '{"query":"Workers AI"}',
+      },
+    ]);
+  });
+
+  it('keeps accumulating when the opening marker is an empty object instead of a string', async () => {
+    const model = modelWithStream([
+      deltaFrame({ index: 0, function: { name: 'search_cloudflare_documentation', arguments: {} } }),
+      deltaFrame({ index: 0, function: { arguments: '{"query":' } }),
+      deltaFrame({ index: 0, function: { arguments: '"Workers AI"}' } }),
+    ]);
+
+    const parts = (await readStream((await model.doStream(makeOptions())).stream)) as Array<Record<string, unknown>>;
+
+    expect(parts.filter((part) => part.type === 'tool-call')).toEqual([
+      {
+        type: 'tool-call',
+        toolCallType: 'function',
+        toolCallId: 'cloudflare-tool-0',
+        toolName: 'search_cloudflare_documentation',
+        args: '{"query":"Workers AI"}',
+      },
+    ]);
+  });
+
+  it('lets streamed fragments complete a native call that arrived without arguments', async () => {
+    const model = modelWithStream([
+      JSON.stringify({ response: '', tool_calls: [{ name: 'search_cloudflare_documentation', arguments: {} }] }),
+      deltaFrame({ index: 0, function: { arguments: '{"query":"Workers AI"}' } }),
+    ]);
+
+    const parts = (await readStream((await model.doStream(makeOptions())).stream)) as Array<Record<string, unknown>>;
+
+    expect(parts.filter((part) => part.type === 'tool-call')).toEqual([
+      {
+        type: 'tool-call',
+        toolCallType: 'function',
+        toolCallId: 'cloudflare-tool-0',
+        toolName: 'search_cloudflare_documentation',
+        args: '{"query":"Workers AI"}',
+      },
+    ]);
+  });
+
+  it('still produces a proxy-side call with empty arguments when every frame carries none', async () => {
+    const model = modelWithStream([
+      JSON.stringify({ response: '', tool_calls: [{ name: 'migrate_pages_to_workers_guide', arguments: {} }] }),
+    ]);
+
+    const parts = (await readStream((await model.doStream(makeOptions())).stream)) as Array<Record<string, unknown>>;
+
+    expect(parts.filter((part) => part.type === 'tool-call')).toEqual([
+      {
+        type: 'tool-call',
+        toolCallType: 'function',
+        toolCallId: 'cloudflare-tool-0',
+        toolName: 'migrate_pages_to_workers_guide',
+        args: '{}',
+      },
+    ]);
   });
 
   it('does not render a token twice when the chunk carries it in both shapes', async () => {

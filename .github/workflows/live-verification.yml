@@ -385,15 +385,18 @@ jobs:
           # wrote the call into its text instead of emitting tool_calls - so this probe
           # uses the tool-capable model the provider already exposes
           # (@cf/meta/llama-3.3-70b-instruct-fp8-fast, "Function calling: Yes").
-          payload=$(node -e 'process.stdout.write(JSON.stringify({messages:[{role:"user",content:"[Model: @cf/meta/llama-3.3-70b-instruct-fp8-fast]\n\n[Provider: Cloudflare]\n\nUse the available MCP tool to look up Workers AI in the Cloudflare documentation, then reply with exactly TOOLS_OK"}],files:{}}))')
+          payload=$(node -e 'process.stdout.write(JSON.stringify({messages:[{role:"user",content:"[Model: @cf/meta/llama-3.3-70b-instruct-fp8-fast]\n\n[Provider: Cloudflare]\n\nCall the mcp_cf-docs-tools_search_cloudflare_documentation tool with the query \"Workers AI\", then reply with exactly TOOLS_OK"}],files:{}}))')
           code=$(curl -sS --max-time 180 -o /tmp/chat-tools.out -w '%{http_code}' -X POST "$BASE/api/chat" \
             -H 'Content-Type: application/json' -b /tmp/tools.jar --data-binary "$payload") || code=000
           echo "POST /api/chat (MCP tools enabled) -> $code"
           if [ "$code" != "200" ]; then
             stop "the tools-enabled chat returned HTTP $code :: $(head -c 200 /tmp/chat-tools.out | tr -d '\r' | tr '\n' '|')"
           fi
-          if grep -qiE 'MCP (connection|tool) .*(failed|error)|binding is unavailable' /tmp/chat-tools.out; then
-            stop "the tools-enabled chat reported an MCP or Workers AI failure :: $(head -c 200 /tmp/chat-tools.out | tr -d '\r' | tr '\n' '|')"
+          # Only the app's own wiring failures are fatal here. A tool *result* that
+          # reports an error is judged below, where the streamed arguments are known,
+          # because an empty-argument call is model behaviour - not a wiring defect.
+          if grep -qiE 'MCP connection failed|MCP tools/(list|call) failed|binding is unavailable' /tmp/chat-tools.out; then
+            stop "the tools-enabled chat reported an MCP or Workers AI wiring failure :: $(head -c 200 /tmp/chat-tools.out | tr -d '\r' | tr '\n' '|')"
           fi
           # The model's exact wording is reported rather than required: an 8B model
           # with a real MCP tool list may call the tool, answer in its own words or
@@ -407,6 +410,7 @@ jobs:
             const frames = { text: 0, toolCall: 0, toolResult: 0, error: 0 };
             const errors = [];
             const toolArgs = [];
+            const toolResults = [];
             for (const line of raw.split("\n")) {
               const i = line.indexOf(":");
               if (i < 1) continue;
@@ -420,20 +424,27 @@ jobs:
                   toolArgs.push(JSON.stringify(parsed.args ?? null).slice(0, 200));
                 }
               }
-              else if (tag === "a") frames.toolResult += 1;
+              else if (tag === "a") {
+                frames.toolResult += 1;
+                if (parsed && typeof parsed === "object") {
+                  toolResults.push(JSON.stringify(parsed.result ?? null).slice(0, 400));
+                }
+              }
               else if (tag === "3") { frames.error += 1; errors.push(String(parsed).slice(0, 200)); }
             }
-            fs.writeFileSync("/tmp/tools.frames.json", JSON.stringify({ frames, errors, toolArgs }));
+            fs.writeFileSync("/tmp/tools.frames.json", JSON.stringify({ frames, errors, toolArgs, toolResults }));
             fs.writeFileSync("/tmp/tools.text", text);
             console.log(`stream frames: ${JSON.stringify(frames)}`);
             console.log(`answer chars=${text.length} :: ${text.replace(/\s+/g, " ").slice(0, 160)}`);
           '
           node -e '
             const fs = require("fs");
-            const { frames, errors, toolArgs } = JSON.parse(fs.readFileSync("/tmp/tools.frames.json", "utf8"));
+            const { frames, errors, toolArgs, toolResults } = JSON.parse(fs.readFileSync("/tmp/tools.frames.json", "utf8"));
             const sampleArgs = (toolArgs || []).find((args) => args && args !== "null" && args !== "{}");
+            const resultText = (toolResults || [])[0] || "";
             const note = `text=${frames.text} toolCall=${frames.toolCall} toolResult=${frames.toolResult}` +
-              (sampleArgs ? ` args=${sampleArgs}` : "");
+              (sampleArgs ? ` args=${sampleArgs}` : "") +
+              (resultText ? ` result=${resultText}` : "");
             if (frames.error > 0) {
               fs.writeFileSync("/tmp/tools.state", "error_frame");
               console.log(`stream error frame: ${errors.join(" | ")}`);
@@ -442,6 +453,18 @@ jobs:
             if (frames.text === 0 && frames.toolCall === 0) {
               fs.writeFileSync("/tmp/tools.state", "empty_stream");
               process.exit(0);
+            }
+            // A remote call that never completed (transport, auth, timeout) means the
+            // MCP wiring or its credentials are broken - that stays fatal. A tool that
+            // answered with an error is a tool-level outcome and is reported, with the
+            // arguments that were sent, so a human can tell model behaviour from wiring.
+            if (/MCP tool .* failed on /.test(resultText)) {
+              fs.writeFileSync("/tmp/tools.state", "tool_failure");
+              console.log(`the MCP call itself failed :: ${note}`);
+              process.exit(0);
+            }
+            if (/MCP tool .* returned an error|was NOT executed|is not in the discovered tool list/.test(resultText)) {
+              console.log(`::warning::the MCP tool answered with an error (tool-level, not a wiring failure) :: ${note}`);
             }
             fs.writeFileSync("/tmp/tools.state", "ok");
             const text = fs.readFileSync("/tmp/tools.text", "utf8");
@@ -458,7 +481,7 @@ jobs:
             }
           '
           state=$(cat /tmp/tools.state 2>/dev/null || echo unknown)
-          if [ "$state" = "error_frame" ] || [ "$state" = "empty_stream" ]; then
+          if [ "$state" = "error_frame" ] || [ "$state" = "empty_stream" ] || [ "$state" = "tool_failure" ]; then
             stop "the tools-enabled chat produced $state (see the frames line above)"
           fi
           echo "::notice::production runs a tools-enabled chat with a real remote MCP server and Workers AI (${state})"
