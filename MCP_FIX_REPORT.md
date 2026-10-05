@@ -53,7 +53,7 @@ OAuth callback now redirects to `/?settings=connection&mcp_oauth=error&reason=�
 
 ### GitHub MCP
 
-Catalog entry: `https://api.githubcopilot.com/mcp/` as **bearer** (PAT). OAuth for GitHub's remote server requires a GitHub App registered by this host — PAT is the supported path. Toolset URLs (`/mcp/x/repos,issues,…`) are documented in the catalog note.
+Catalog chips: `https://api.githubcopilot.com/mcp/` (default) and `https://api.githubcopilot.com/mcp/x/all` as **bearer** (PAT). OAuth for GitHub's remote server requires a GitHub App registered by this host — PAT is the supported path. Toolsets are **distinct** URLs (`/mcp/x/<name>`, `/mcp/x/all`). Comma-combined paths (`/mcp/x/repos,issues`) are not in GitHub's remote-server docs.
 
 ## Security preserved
 
@@ -86,6 +86,19 @@ Catalog entry: `https://api.githubcopilot.com/mcp/` as **bearer** (PAT). OAuth f
 | `pnpm exec wrangler deploy --dry-run` | pass |
 | `node scripts/ci/workers-runtime-smoke.mjs` | OK (workerd MCP connect + tools/call) |
 
+## GitHub Actions (PR #8)
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Test (Node 20.15.1, run `37296938850`) | fail | CompressionStream cookie sealing needs Node 22 |
+| Test (Node 22.16.0, run `37297274120`) | pass | 1m25s, including workerd MCP smoke |
+| Validate PR Title | pass | run `37297330468` (subject must not start with uppercase) |
+| validate | pass | run `37297274224` |
+| live-probe | pass | run `37297268518` (2m1s, all 15 steps) |
+| Workers Builds: bolt-replit | pass | preview `arena-01a10b89-bolt-replit` build `6ea17633-4da7-4e89-b653-290892b91f5d` |
+
+`live-verification.yml` probes **Cloudflare** Workers AI (`@cf/meta/llama-3.1-8b-instruct-fp8`, `@cf/meta/llama-3.3-70b-instruct-fp8-fast`), not Groq `llama-3.1-8b-instant`. No Groq live step exists (would need `GROQ_API_KEY`). Groq static catalog already uses `openai/gpt-oss-20b` / `120b` and `qwen/qwen3.8-27b`; Llama 3.1/3.3 stay labeled enterprise.
+
 ## Live verification from this sandbox
 
-**Blocked:** TLS to `bolt-replit.biharzone37.workers.dev` and `api.githubcopilot.com` (`SSL_ERROR_SYSCALL` / `ECONNRESET`). GitHub.com API via `gh` works. After merge/deploy, GitHub Actions `live-verification.yml` is the live probe path.
+**Blocked:** TLS to `bolt-replit.biharzone37.workers.dev` and `api.githubcopilot.com` (`SSL_ERROR_SYSCALL` / `ECONNRESET`). GitHub.com API via `gh` works. GitHub Actions `live-probe` above is the live path.

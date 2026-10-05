@@ -51,9 +51,14 @@ describe('Groq provider', () => {
     expect(names).not.toContain('llama-3.2-90b-vision-preview');
     expect(names).not.toContain('llama-3.2-3b-preview');
     expect(names).not.toContain('llama-3.2-1b-preview');
+    expect(names).not.toContain('groq/compound');
+    expect(names).not.toContain('groq/compound-mini');
 
     const gptOss = provider.staticModels.find((model) => model.name === 'openai/gpt-oss-20b');
     expect(gptOss?.maxTokenAllowed).toBe(65536);
+
+    const qwen = provider.staticModels.find((model) => model.name === 'qwen/qwen3.8-27b');
+    expect(qwen?.maxTokenAllowed).toBe(16384);
   });
 
   it('honours a configured baseUrl instead of the hardcoded Groq host', () => {

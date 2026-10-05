@@ -30,7 +30,14 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     name: 'GitHub',
     url: 'https://api.githubcopilot.com/mcp/',
     auth: 'bearer',
-    note: 'GitHub’s official remote MCP server (https://api.githubcopilot.com/mcp/). Paste a PAT as the bearer token. Fine-grained: Contents read & write, Metadata read, and Administration read & write to create repos. Classic: repo scope. To load fewer tools, use a toolset URL such as https://api.githubcopilot.com/mcp/x/repos,issues,pull_requests,users,context (see GitHub remote-server docs). OAuth requires a GitHub App registered by this host — PAT is the supported path here.',
+    note: 'GitHub’s official remote MCP server. Paste a PAT as the bearer token (Authorization: Bearer). Fine-grained: Contents read & write, Metadata read, Administration read & write to create repos. Classic: repo scope. Default URL is https://api.githubcopilot.com/mcp/. Toolsets are distinct URLs such as https://api.githubcopilot.com/mcp/x/all, https://api.githubcopilot.com/mcp/x/repos, https://api.githubcopilot.com/mcp/x/issues (append /readonly for read-only). Comma-combined path segments are not in GitHub’s remote-server docs. OAuth requires a GitHub App registered by this host — PAT is the supported path here.',
+  },
+  {
+    id: 'github-all',
+    name: 'GitHub (all tools)',
+    url: 'https://api.githubcopilot.com/mcp/x/all',
+    auth: 'bearer',
+    note: 'GitHub remote MCP, all toolsets: https://api.githubcopilot.com/mcp/x/all. Same PAT as the default GitHub chip. Other toolsets are distinct URLs under /mcp/x/<name> (see GitHub remote-server.md).',
   },
   {
     id: 'figma',
