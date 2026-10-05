@@ -105,8 +105,21 @@ describe('MCP connection panel', () => {
      * servers that would connect without authentication.
      */
     expect(screen.getByRole('button', { name: /Use Cloudflare.*\(OAuth required\)/ })).toBeTruthy();
-    expect(screen.getByRole('button', { name: /Use GitHub.*\(bearer\)/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /^Use GitHub \(bearer\)$/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /^Use GitHub \(all tools\) \(bearer\)$/ })).toBeTruthy();
     expect(screen.getByRole('button', { name: /Use Figma.*\(OAuth required\)/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /^Use GitHub \(bearer\)$/ }));
+
+    expect((screen.getByLabelText('MCP server Streamable HTTP URL') as HTMLInputElement).value).toBe(
+      'https://api.githubcopilot.com/mcp/',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Use GitHub \(all tools\) \(bearer\)$/ }));
+
+    expect((screen.getByLabelText('MCP server Streamable HTTP URL') as HTMLInputElement).value).toBe(
+      'https://api.githubcopilot.com/mcp/x/all',
+    );
 
     fireEvent.click(screen.getByRole('button', { name: /Use Cloudflare/ }));
 
