@@ -55,6 +55,7 @@ import {
   transportAuthProvider,
   type McpOAuthStore,
 } from '~/lib/.server/mcp-oauth';
+import { catalogAuthForUrl } from '~/lib/mcp/catalog';
 
 export const MCP_PUBLIC_COOKIE = 'mcpServers';
 export const MCP_SECRET_COOKIE = 'mcpSecrets';
@@ -252,8 +253,25 @@ export function getMcpErrorMessage(error: unknown, phase: 'connect' | 'list' | '
   return classifyMcpError(error, phase).message;
 }
 
-export function classifyMcpError(error: unknown, phase: 'connect' | 'list' | 'call' = 'connect'): McpError {
+export function classifyMcpError(
+  error: unknown,
+  phase: 'connect' | 'list' | 'call' = 'connect',
+  hasBearerToken = false,
+): McpError {
   if (error instanceof McpError) {
+    if (
+      hasBearerToken &&
+      (error.code === 'http_401' || error.code === 'oauth_required' || error.code === 'invalid_bearer_token')
+    ) {
+      return error.code === 'invalid_bearer_token'
+        ? error
+        : new McpError(
+            'invalid_bearer_token',
+            'The MCP server rejected the bearer token (HTTP 401).',
+            'Check that the token is valid and not expired, then reconnect the server.',
+          );
+    }
+
     return error;
   }
 
@@ -271,11 +289,17 @@ export function classifyMcpError(error: unknown, phase: 'connect' | 'list' | 'ca
   ).slice(0, 400);
 
   if (status === 401) {
-    return new McpError(
-      'http_401',
-      'The MCP server answered HTTP 401 (authentication required).',
-      'Connect the server with OAuth or provide a valid bearer token.',
-    );
+    return hasBearerToken
+      ? new McpError(
+          'invalid_bearer_token',
+          'The MCP server rejected the bearer token (HTTP 401).',
+          'Check that the token is valid and not expired, then reconnect the server.',
+        )
+      : new McpError(
+          'http_401',
+          'The MCP server answered HTTP 401 (authentication required).',
+          'Connect the server with OAuth or provide a valid bearer token.',
+        );
   }
 
   if (status === 403) {
@@ -286,7 +310,7 @@ export function classifyMcpError(error: unknown, phase: 'connect' | 'list' | 'ca
     );
   }
 
-  const fromMessage = classifyRawMessage(rawMessage, false);
+  const fromMessage = classifyRawMessage(rawMessage, hasBearerToken);
 
   if (fromMessage) {
     return fromMessage;
@@ -750,7 +774,7 @@ export async function discoverMcpTools(
       return result.tools.map(normalizeToolInfo);
     });
   } catch (error) {
-    throw classifyMcpError(error, phase);
+    throw classifyMcpError(error, phase, Boolean(context.bearerToken));
   }
 }
 
@@ -1005,17 +1029,78 @@ export async function refreshServerStatus(
       lastCheckedAt: new Date().toISOString(),
     };
   } catch (error) {
-    const classified = classifyMcpError(error);
-    const authRequired = classified.code === 'oauth_required' || classified.code === 'http_401';
+    const classified = classifyMcpError(error, 'connect', Boolean(state.secrets[server.id]));
+    const resolved = resolveDiscoveryFailure(server, classified, Boolean(state.secrets[server.id]));
 
     return {
       ...server,
-      authMode: authRequired ? 'oauth' : server.authMode,
-      status: authRequired ? 'auth_required' : 'error',
-      ...mcpStatusFields(classified),
+      ...resolved,
       lastCheckedAt: new Date().toISOString(),
     };
   }
+}
+
+/**
+ * Turns a tools/list failure into the status the UI should show.
+ *
+ * GitHub's remote MCP answers HTTP 401 until a PAT is sent. That is not an
+ * OAuth requirement for this host (OAuth needs a GitHub App). Forcing
+ * `authMode: 'oauth'` made the Connection tab offer "Connect with OAuth" and
+ * hide the PAT path.
+ */
+export function resolveDiscoveryFailure(
+  server: Pick<McpServerConfig, 'authMode' | 'url'>,
+  classified: McpError,
+  hadBearer: boolean,
+): {
+  authMode: McpAuthMode;
+  status: McpServerStatus;
+  statusMessage: string;
+  statusCode: McpErrorCode;
+  statusHint?: string;
+} {
+  const catalogAuth = catalogAuthForUrl(server.url);
+  const wantsBearer = server.authMode === 'bearer' || catalogAuth === 'bearer';
+  const wantsOAuth = server.authMode === 'oauth' || catalogAuth === 'oauth';
+  const authChallenge =
+    classified.code === 'http_401' ||
+    classified.code === 'oauth_required' ||
+    classified.code === 'invalid_bearer_token';
+
+  if (hadBearer && authChallenge) {
+    const error =
+      classified.code === 'invalid_bearer_token'
+        ? classified
+        : new McpError(
+            'invalid_bearer_token',
+            'The MCP server rejected the bearer token (HTTP 401).',
+            'Check that the token is valid and not expired, then reconnect the server.',
+          );
+
+    return { authMode: 'bearer', status: 'error', ...mcpStatusFields(error) };
+  }
+
+  if (wantsBearer && !wantsOAuth && authChallenge) {
+    return {
+      authMode: 'bearer',
+      status: 'auth_required',
+      ...mcpStatusFields(
+        new McpError(
+          'http_401',
+          'The MCP server requires a bearer token (HTTP 401).',
+          'Paste a PAT as the bearer token. GitHub’s remote MCP server does not complete OAuth unless this host registers a GitHub App.',
+        ),
+      ),
+    };
+  }
+
+  const authRequired = classified.code === 'oauth_required' || classified.code === 'http_401';
+
+  return {
+    authMode: authRequired || wantsOAuth ? (authRequired ? 'oauth' : server.authMode) : server.authMode,
+    status: authRequired ? 'auth_required' : 'error',
+    ...mcpStatusFields(classified),
+  };
 }
 
 export function publicMcpServer(server: McpServerConfig): McpServerConfig {

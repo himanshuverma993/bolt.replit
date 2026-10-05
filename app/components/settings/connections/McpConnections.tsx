@@ -221,7 +221,11 @@ export default function McpConnections() {
       if (added?.status === 'connected') {
         toast.success(`Connected to ${added.name}; discovered ${added.tools.length} tool(s)`);
       } else if (added?.status === 'auth_required') {
-        toast.info(`${added.name} requires OAuth; use “Connect with OAuth”.`);
+        toast.info(
+          added.authMode === 'bearer'
+            ? `${added.name} needs a bearer token (GitHub: a PAT). Paste it and add the server again.`
+            : `${added.name} requires OAuth; use “Connect with OAuth”.`,
+        );
       } else {
         toast.error(
           `${added?.statusMessage ?? 'MCP server was saved but could not be connected'}${
@@ -376,7 +380,7 @@ export default function McpConnections() {
                     {server.authMode} · {server.tools.length} tool{server.tools.length === 1 ? '' : 's'}
                   </span>
                   <div className="ml-auto flex gap-2">
-                    {server.status === 'auth_required' && (
+                    {server.status === 'auth_required' && server.authMode === 'oauth' && (
                       <button
                         type="button"
                         onClick={() => runAction('authorize', server)}
@@ -384,6 +388,9 @@ export default function McpConnections() {
                       >
                         Connect with OAuth
                       </button>
+                    )}
+                    {server.status === 'auth_required' && server.authMode === 'bearer' && (
+                      <span className="text-xs text-amber-400">Paste a PAT as the bearer token and add again</span>
                     )}
                     {server.authMode === 'oauth' && server.status === 'connected' && (
                       <button

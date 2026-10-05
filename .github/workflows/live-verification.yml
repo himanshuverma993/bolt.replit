@@ -698,3 +698,140 @@ jobs:
             console.log(`::notice::OAuth client metadata served for ${body.client_id}`);
           '
 
+
+      - name: GitHub and Cloudflare MCP hosts from GitHub's network
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          node <<'NODE'
+          const hosts = [
+            { id: 'cf-docs', url: 'https://docs.mcp.cloudflare.com/mcp', expect: 'initialize-ok' },
+            { id: 'cf-oauth', url: 'https://mcp.cloudflare.com/mcp', expect: 'auth' },
+            { id: 'github-default', url: 'https://api.githubcopilot.com/mcp/', expect: 'auth' },
+            { id: 'github-all', url: 'https://api.githubcopilot.com/mcp/x/all', expect: 'auth' },
+            { id: 'github-repos', url: 'https://api.githubcopilot.com/mcp/x/repos', expect: 'auth' },
+          ];
+          const payload = JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'initialize',
+            params: {
+              protocolVersion: '2025-03-26',
+              capabilities: {},
+              clientInfo: { name: 'bolt-live-probe', version: '0.0.3' },
+            },
+          });
+          function redact(value) {
+            return String(value)
+              .replace(/\b(gh[pousr]_[A-Za-z0-9_-]{10,})/g, '[redacted]')
+              .replace(/\b(github_pat_[A-Za-z0-9_-]{10,})/g, '[redacted]')
+              .replace(/Bearer\s+[^\s]+/gi, 'Bearer [redacted]');
+          }
+          async function probe(url, extraHeaders = {}) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 20000);
+            try {
+              const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Accept: 'application/json, text/event-stream',
+                  ...extraHeaders,
+                },
+                body: payload,
+                signal: controller.signal,
+              });
+              const body = redact(await response.text()).replace(/\s+/g, ' ').slice(0, 280);
+              return { status: response.status, body, www: response.headers.get('www-authenticate') || 'none' };
+            } catch (error) {
+              return { status: 0, body: redact(error instanceof Error ? error.message : String(error)).slice(0, 280), www: 'none' };
+            } finally {
+              clearTimeout(timer);
+            }
+          }
+          function initializeOk(result) {
+            return result.status === 200 && /initialize|protocolVersion|serverInfo|"result"/i.test(result.body);
+          }
+          function authChallenge(result) {
+            return result.status === 401 || result.status === 403 || /unauthori|unauthorized|forbidden|oauth/i.test(result.body);
+          }
+          (async () => {
+            let failed = 0;
+            for (const host of hosts) {
+              const result = await probe(host.url);
+              console.log(`${host.id} ${host.url} -> HTTP ${result.status} www=${result.www} :: ${result.body}`);
+              if (host.expect === 'initialize-ok') {
+                if (!initializeOk(result)) {
+                  console.log(`::error::${host.id} did not initialize (HTTP ${result.status})`);
+                  failed += 1;
+                } else {
+                  console.log(`::notice::${host.id} initialize succeeded`);
+                }
+              } else if (initializeOk(result)) {
+                console.log(`::notice::${host.id} initialize succeeded without credentials`);
+              } else if (authChallenge(result)) {
+                console.log(`::notice::${host.id} reachable and requires auth (HTTP ${result.status})`);
+              } else {
+                console.log(`::error::${host.id} unreachable or unclassified (HTTP ${result.status}) :: ${result.body}`);
+                failed += 1;
+              }
+            }
+            const token = process.env.GH_TOKEN;
+            if (token) {
+              const authed = await probe('https://api.githubcopilot.com/mcp/', { Authorization: `Bearer ${token}` });
+              if (initializeOk(authed)) {
+                console.log(`::notice::GitHub Actions token was accepted by GitHub remote MCP (HTTP ${authed.status})`);
+              } else {
+                console.log(`::notice::GitHub Actions token was not accepted by GitHub remote MCP (HTTP ${authed.status}); a user PAT is required. This is expected.`);
+              }
+            }
+            if (failed) process.exit(1);
+          })().catch((error) => {
+            console.log(`::error::MCP host probe crashed :: ${redact(error instanceof Error ? error.message : String(error))}`);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Worker classifies GitHub remote MCP as PAT/bearer, never silent-connected
+        if: ${{ steps.target.outputs.is_production == 'false' }}
+        run: |
+          set -uo pipefail
+          BASE="${{ steps.target.outputs.base }}"
+          code=$(curl -sS --max-time 60 -o /tmp/mcp-github.json -w '%{http_code}' -X POST "$BASE/api/mcp" \
+            -H 'Content-Type: application/json' -H "Origin: $BASE" -c /tmp/mcp-github.jar \
+            --data '{"action":"add","name":"github-live","url":"https://api.githubcopilot.com/mcp/"}') || code=000
+          echo "POST /api/mcp (GitHub remote, no PAT) -> $code :: $(head -c 400 /tmp/mcp-github.json | tr -d '\r' | tr '\n' '|')"
+          [ "$code" = "200" ] || { echo "::error::adding GitHub remote MCP returned HTTP $code"; exit 1; }
+          if grep -qiE 'access_token|refresh_token|"token"|gh[pousr]_|github_pat_' /tmp/mcp-github.json; then
+            echo "::error::the GitHub MCP response exposed token material"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const body = JSON.parse(fs.readFileSync("/tmp/mcp-github.json", "utf8"));
+            const server = body.server || {};
+            const tools = Array.isArray(server.tools) ? server.tools.length : 0;
+            const note = `status=${server.status} authMode=${server.authMode} code=${server.statusCode || "none"} tools=${tools} :: ${String(server.statusMessage || "").slice(0, 180)}`;
+            if (server.status === "connected") {
+              if (tools < 1) {
+                console.log("::error::GitHub MCP was reported connected without discovered tools (the original cookie/catalog bug)");
+                process.exit(2);
+              }
+              console.log(`::warning::GitHub MCP connected without a PAT (${note}) — unexpected; treating as Unverified success`);
+              process.exit(0);
+            }
+            if (server.authMode === "oauth") {
+              console.log(`::error::GitHub remote MCP was classified as OAuth; PAT-first path is required :: ${note}`);
+              process.exit(3);
+            }
+            if (server.status !== "auth_required" && server.status !== "error") {
+              console.log(`::error::unexpected GitHub MCP status :: ${note}`);
+              process.exit(4);
+            }
+            if (!server.statusCode || server.statusCode === "unknown") {
+              console.log(`::error::GitHub MCP refusal was not classified :: ${note}`);
+              process.exit(5);
+            }
+            console.log(`::notice::GitHub remote MCP was refused without a PAT and stayed on the bearer path (${note})`);
+          '

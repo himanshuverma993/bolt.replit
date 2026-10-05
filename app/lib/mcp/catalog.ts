@@ -48,6 +48,44 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
   },
 ];
 
+function urlCandidates(url: string): string[] {
+  try {
+    const parsed = new URL(url);
+    const withSlash = parsed.pathname.endsWith('/') ? parsed.toString() : `${parsed.toString().replace(/\/?$/, '/')}`;
+    const withoutSlash = withSlash.replace(/\/+$/, '') || parsed.origin;
+
+    return [...new Set([url, parsed.toString(), withSlash, withoutSlash])];
+  } catch {
+    return [url];
+  }
+}
+
 export function catalogEntryFor(url: string): McpCatalogEntry | undefined {
-  return MCP_CATALOG.find((entry) => entry.url === url);
+  const candidates = urlCandidates(url);
+  return MCP_CATALOG.find((entry) => candidates.includes(entry.url));
+}
+
+/**
+ * Auth the UI/server should assume for a URL. GitHub's remote MCP is PAT/bearer
+ * on every `/mcp` path (default, `/mcp/x/all`, `/mcp/x/<toolset>`), even when
+ * the exact toolset is not a catalog chip.
+ */
+export function catalogAuthForUrl(url: string): McpCatalogAuth | undefined {
+  const entry = catalogEntryFor(url);
+
+  if (entry) {
+    return entry.auth;
+  }
+
+  try {
+    const parsed = new URL(url);
+
+    if (parsed.hostname === 'api.githubcopilot.com' && parsed.pathname.startsWith('/mcp')) {
+      return 'bearer';
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
 }

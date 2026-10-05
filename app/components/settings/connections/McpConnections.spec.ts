@@ -219,6 +219,31 @@ describe('MCP connection panel', () => {
     expect(post?.body).toEqual({ action: 'set-allow-risky', id: 'internal', allowRiskyTools: true });
   });
 
+  it('does not offer OAuth for a GitHub server that needs a PAT', async () => {
+    stubMcp({
+      servers: [
+        {
+          id: 'github',
+          name: 'GitHub',
+          url: 'https://api.githubcopilot.com/mcp/',
+          enabled: true,
+          authMode: 'bearer',
+          status: 'auth_required',
+          statusCode: 'http_401',
+          statusMessage: 'The MCP server requires a bearer token (HTTP 401).',
+          tools: [],
+        },
+      ],
+    });
+
+    render(element);
+
+    await screen.findByText('GitHub');
+    expect(screen.queryByRole('button', { name: 'Connect with OAuth' })).toBeNull();
+    expect(screen.getByText(/Paste a PAT as the bearer token/)).toBeTruthy();
+    expect(screen.getByText('Authentication required')).toBeTruthy();
+  });
+
   it('reports an OAuth callback failure from the URL and strips the query parameters', async () => {
     window.history.replaceState(
       {},

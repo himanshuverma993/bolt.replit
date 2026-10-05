@@ -11,6 +11,8 @@ import {
   getMcpTools,
   mcpStateHeaders,
   readMcpState,
+  resolveDiscoveryFailure,
+  McpError,
   type McpServerConfig,
   type McpToolInfo,
   MCP_MAX_TOOL_OUTPUT,
@@ -321,8 +323,38 @@ describe('MCP Streamable HTTP client', () => {
       }),
     ).catch((error: unknown) => error);
 
-    expect(classifyMcpError(withBearer).code).toBe('http_401');
-    expect(classifyMcpError(withBearer).message).toContain('401');
+    expect(classifyMcpError(withBearer, 'connect', true).code).toBe('invalid_bearer_token');
+    expect(classifyMcpError(withBearer, 'connect', true).message).toMatch(/401|bearer/i);
+  });
+
+  it('does not promote GitHub remote MCP 401s into an OAuth flow', () => {
+    const github = { authMode: 'authless' as const, url: 'https://api.githubcopilot.com/mcp/' };
+    const challenge = new McpError('http_401', 'The MCP server answered HTTP 401 (authentication required).');
+    const withoutPat = resolveDiscoveryFailure(github, challenge, false);
+
+    expect(withoutPat.authMode).toBe('bearer');
+    expect(withoutPat.status).toBe('auth_required');
+    expect(withoutPat.statusCode).toBe('http_401');
+    expect(withoutPat.statusHint).toMatch(/PAT/);
+
+    const rejectedPat = resolveDiscoveryFailure(
+      { authMode: 'bearer', url: 'https://api.githubcopilot.com/mcp/x/all' },
+      challenge,
+      true,
+    );
+
+    expect(rejectedPat.authMode).toBe('bearer');
+    expect(rejectedPat.status).toBe('error');
+    expect(rejectedPat.statusCode).toBe('invalid_bearer_token');
+
+    const generic = resolveDiscoveryFailure(
+      { authMode: 'authless', url: 'https://mcp.example.com/mcp' },
+      new McpError('oauth_required', 'needs oauth'),
+      false,
+    );
+
+    expect(generic.authMode).toBe('oauth');
+    expect(generic.status).toBe('auth_required');
   });
 
   it('classifies malformed responses and transport failures', async () => {
