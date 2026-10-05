@@ -61,6 +61,34 @@ export function missingSecretMessage(purpose: string): string {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/**
+ * Browser cookie value limit is ~4096 bytes for `name=value` combined.
+ * 3500 bytes of payload leaves room for the cookie name and attributes.
+ * Never write a larger single cookie: browsers silently drop it.
+ */
+export const COOKIE_VALUE_LIMIT_BYTES = 3500;
+
+/** Upper bound on shards per logical cookie (≈ 28 KiB of payload). */
+export const MAX_COOKIE_SHARDS = 8;
+
+async function transformBytes(bytes: Uint8Array, stream: CompressionStream | DecompressionStream): Promise<Uint8Array> {
+  const writer = stream.writable.getWriter();
+  await writer.write(bytes as unknown as BufferSource);
+  await writer.close();
+
+  const raw = await new Response(stream.readable).arrayBuffer();
+
+  return new Uint8Array(raw as ArrayBuffer);
+}
+
+async function deflateBytes(bytes: Uint8Array): Promise<Uint8Array> {
+  return transformBytes(bytes, new CompressionStream('deflate'));
+}
+
+async function inflateBytes(bytes: Uint8Array): Promise<Uint8Array> {
+  return transformBytes(bytes, new DecompressionStream('deflate'));
+}
+
 export function base64UrlEncode(bytes: Uint8Array): string {
   let binary = '';
 
@@ -104,18 +132,43 @@ async function deriveHmacKey(secret: string): Promise<CryptoKey> {
   ]);
 }
 
-const SEALED_PREFIX = 'v1.';
+const SEALED_PREFIX_V1 = 'v1.';
+const SEALED_PREFIX_V2 = 'v2.';
 
-/** Seals a JSON payload with AES-256-GCM. Output is `v1.<base64url(iv || ciphertext)>`. */
-export async function sealJsonPayload(payload: unknown, secret: string): Promise<string> {
+async function encryptPacked(plaintext: Uint8Array, secret: string): Promise<string> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await deriveAesKey(secret);
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode(JSON.stringify(payload)));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
   const packed = new Uint8Array(iv.byteLength + ciphertext.byteLength);
   packed.set(iv);
   packed.set(new Uint8Array(ciphertext), iv.byteLength);
 
-  return `${SEALED_PREFIX}${base64UrlEncode(packed)}`;
+  return base64UrlEncode(packed);
+}
+
+async function decryptPacked(packedB64: string, secret: string): Promise<Uint8Array | undefined> {
+  try {
+    const packed = base64UrlDecode(packedB64);
+    const iv = packed.slice(0, 12);
+    const ciphertext = packed.slice(12);
+    const key = await deriveAesKey(secret);
+    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+
+    return new Uint8Array(plaintext);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Seals a JSON payload with DEFLATE + AES-256-GCM.
+ * Output is `v2.<base64url(iv || ciphertext)>`. Legacy `v1.` cookies (uncompressed)
+ * are still readable by {@link openJsonPayload}.
+ */
+export async function sealJsonPayload(payload: unknown, secret: string): Promise<string> {
+  const compressed = await deflateBytes(encoder.encode(JSON.stringify(payload)));
+
+  return `${SEALED_PREFIX_V2}${await encryptPacked(compressed, secret)}`;
 }
 
 /**
@@ -127,21 +180,37 @@ export async function sealJsonPayload(payload: unknown, secret: string): Promise
  * caller when it matters.
  */
 export async function openJsonPayload<T>(value: string, secret: string): Promise<T | undefined> {
-  if (!value.startsWith(SEALED_PREFIX)) {
-    return undefined;
+  if (value.startsWith(SEALED_PREFIX_V2)) {
+    const decrypted = await decryptPacked(value.slice(SEALED_PREFIX_V2.length), secret);
+
+    if (!decrypted) {
+      return undefined;
+    }
+
+    try {
+      const inflated = await inflateBytes(decrypted);
+
+      return JSON.parse(decoder.decode(inflated)) as T;
+    } catch {
+      return undefined;
+    }
   }
 
-  try {
-    const packed = base64UrlDecode(value.slice(SEALED_PREFIX.length));
-    const iv = packed.slice(0, 12);
-    const ciphertext = packed.slice(12);
-    const key = await deriveAesKey(secret);
-    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+  if (value.startsWith(SEALED_PREFIX_V1)) {
+    const decrypted = await decryptPacked(value.slice(SEALED_PREFIX_V1.length), secret);
 
-    return JSON.parse(decoder.decode(plaintext)) as T;
-  } catch {
-    return undefined;
+    if (!decrypted) {
+      return undefined;
+    }
+
+    try {
+      return JSON.parse(decoder.decode(decrypted)) as T;
+    } catch {
+      return undefined;
+    }
   }
+
+  return undefined;
 }
 
 /** Constant-time-ish string comparison for signatures. */
@@ -242,6 +311,85 @@ export function serializeCookie(name: string, value: string, attributes: CookieA
   }
 
   return parts.join('; ');
+}
+
+export function shardedCookieName(baseName: string, index: number): string {
+  return index === 0 ? baseName : `${baseName}_${index + 1}`;
+}
+
+/** Splits an ASCII cookie payload so each shard is ≤ {@link COOKIE_VALUE_LIMIT_BYTES}. */
+export function splitCookieValue(value: string, limitBytes = COOKIE_VALUE_LIMIT_BYTES): string[] {
+  const byteLength = encoder.encode(value).byteLength;
+
+  if (byteLength <= limitBytes) {
+    return [value];
+  }
+
+  /*
+   * Sealed/signed payloads are base64url (ASCII). Splitting by character
+   * offset is therefore the same as splitting by bytes.
+   */
+  const chunks: string[] = [];
+
+  for (let offset = 0; offset < value.length; offset += limitBytes) {
+    chunks.push(value.slice(offset, offset + limitBytes));
+  }
+
+  return chunks;
+}
+
+export function cookieShardCount(value: string, limitBytes = COOKIE_VALUE_LIMIT_BYTES): number {
+  return splitCookieValue(value, limitBytes).length;
+}
+
+/** Reassembles `name` + `name_2` + … from a parsed cookie map. */
+export function joinShardedCookie(cookies: Record<string, string>, baseName: string): string | undefined {
+  if (cookies[baseName] === undefined) {
+    return undefined;
+  }
+
+  let combined = cookies[baseName];
+
+  for (let shard = 2; shard <= MAX_COOKIE_SHARDS; shard += 1) {
+    const part = cookies[`${baseName}_${shard}`];
+
+    if (part === undefined) {
+      break;
+    }
+
+    combined += part;
+  }
+
+  return combined;
+}
+
+export function serializeShardedCookies(baseName: string, value: string, attributes: CookieAttributes = {}): string[] {
+  const chunks = splitCookieValue(value);
+
+  if (chunks.length > MAX_COOKIE_SHARDS) {
+    throw new Error(`Cookie ${baseName} needs ${chunks.length} shards; the maximum is ${MAX_COOKIE_SHARDS}.`);
+  }
+
+  const headers = chunks.map((chunk, index) => serializeCookie(shardedCookieName(baseName, index), chunk, attributes));
+
+  for (let index = chunks.length; index < MAX_COOKIE_SHARDS; index += 1) {
+    headers.push(clearCookie(shardedCookieName(baseName, index), { httpOnly: attributes.httpOnly === true }));
+  }
+
+  return headers;
+}
+
+export function clearShardedCookies(baseName: string, options: { httpOnly?: boolean } = {}): string[] {
+  return Array.from({ length: MAX_COOKIE_SHARDS }, (_, index) =>
+    clearCookie(shardedCookieName(baseName, index), options),
+  );
+}
+
+/** Encoded `name=value` pair length, which is what browsers cap at ~4096 bytes. */
+export function cookiePairByteLength(setCookieHeader: string): number {
+  const pair = setCookieHeader.split(';')[0] ?? '';
+
+  return encoder.encode(pair).byteLength;
 }
 
 export function parseCookieHeader(header: string | null | undefined): Record<string, string> {

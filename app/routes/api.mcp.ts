@@ -25,6 +25,7 @@ import {
   type McpOAuthStore,
 } from '~/lib/.server/mcp-oauth';
 import { getRequestOrigin, isSameOriginRequest, isSecureOrigin, type SecretEnvironment } from '~/lib/.server/secrets';
+import { catalogAuthForUrl } from '~/lib/mcp/catalog';
 
 type McpEnv = SecretEnvironment & {
   ASSETS?: unknown;
@@ -119,7 +120,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
         name,
         url,
         enabled: true,
-        authMode: token ? 'bearer' : 'authless',
+        authMode: token ? 'bearer' : (catalogAuthForUrl(url) ?? 'authless'),
         status: 'error',
         tools: [],
         addedAt: new Date().toISOString(),
@@ -138,7 +139,11 @@ export async function action({ request, context }: ActionFunctionArgs) {
       const warnings = [...state.warnings];
 
       if (refreshed.status === 'auth_required') {
-        warnings.push(`${refreshed.name} requires OAuth authorization. Use "Connect with OAuth" to finish signing in.`);
+        warnings.push(
+          refreshed.authMode === 'bearer'
+            ? `${refreshed.name} requires a bearer token (GitHub: a PAT). Paste it in the bearer field and add the server again.`
+            : `${refreshed.name} requires OAuth authorization. Use "Connect with OAuth" to finish signing in.`,
+        );
       }
 
       return json({ server: refreshed, servers, warnings }, { headers });

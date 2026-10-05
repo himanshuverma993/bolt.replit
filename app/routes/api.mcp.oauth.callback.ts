@@ -4,6 +4,7 @@ import {
   mcpStateHeaders,
   readMcpState,
   refreshServerStatus,
+  McpError,
   type McpServerConfig,
   type McpState,
 } from '~/lib/.server/mcp';
@@ -11,11 +12,10 @@ import {
   clearOAuthStateCookie,
   completeMcpAuthorization,
   MCP_OAUTH_STATE_COOKIE,
-  oauthStoreHeaders,
   validateOAuthState,
   McpOAuthError,
 } from '~/lib/.server/mcp-oauth';
-import { getRequestOrigin, readRequestCookies, type SecretEnvironment } from '~/lib/.server/secrets';
+import { getRequestOrigin, readRequestCookies, redactSecrets, type SecretEnvironment } from '~/lib/.server/secrets';
 
 /**
  * MCP OAuth redirect target.
@@ -30,10 +30,15 @@ export async function loader({ request, context }: LoaderFunctionArgs) {
   const url = new URL(request.url);
   const origin = getRequestOrigin(request);
   const serverId = readRequestCookies(request)[MCP_OAUTH_STATE_COOKIE] ?? '';
-  const failure = (reason: string): Response => {
+  const failure = (reason: string, detail?: string): Response => {
     const target = new URL('/', origin);
+    target.searchParams.set('settings', 'connection');
     target.searchParams.set('mcp_oauth', 'error');
-    target.searchParams.set('reason', reason);
+    target.searchParams.set('reason', reason.slice(0, 80));
+
+    if (detail) {
+      target.searchParams.set('detail', redactSecrets(detail).slice(0, 180));
+    }
 
     if (serverId) {
       target.searchParams.set('server', serverId);
@@ -73,7 +78,7 @@ export async function loader({ request, context }: LoaderFunctionArgs) {
     validateOAuthState(oauth, serverId, url.searchParams.get('state'));
   } catch (error) {
     if (error instanceof McpOAuthError) {
-      return failure(error.code);
+      return failure(error.code, error.message);
     }
 
     throw error;
@@ -104,10 +109,6 @@ export async function loader({ request, context }: LoaderFunctionArgs) {
 
     const headers = new Headers();
 
-    for (const cookie of await oauthStoreHeaders(store, env)) {
-      headers.append('Set-Cookie', cookie);
-    }
-
     for (const cookie of await mcpStateHeaders(servers, nextState.secrets, env, store)) {
       headers.append('Set-Cookie', cookie);
     }
@@ -115,6 +116,7 @@ export async function loader({ request, context }: LoaderFunctionArgs) {
     headers.append('Set-Cookie', clearOAuthStateCookie());
 
     const target = new URL('/', origin);
+    target.searchParams.set('settings', 'connection');
     target.searchParams.set('mcp_oauth', refreshed.status === 'connected' ? 'success' : 'error');
     target.searchParams.set('server', serverId);
 
@@ -122,12 +124,18 @@ export async function loader({ request, context }: LoaderFunctionArgs) {
       target.searchParams.set('reason', refreshed.statusCode);
     }
 
+    if (refreshed.status !== 'connected' && refreshed.statusMessage) {
+      target.searchParams.set('detail', redactSecrets(refreshed.statusMessage).slice(0, 180));
+    }
+
     headers.set('Location', target.toString());
 
     return new Response(null, { status: 302, headers });
   } catch (error) {
-    const reason = error instanceof McpOAuthError ? error.code : 'oauth_failed';
+    const reason =
+      error instanceof McpOAuthError ? error.code : error instanceof McpError ? error.code : 'oauth_failed';
+    const detail = error instanceof Error ? error.message : undefined;
 
-    return failure(reason);
+    return failure(reason, detail);
   }
 }

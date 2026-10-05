@@ -5,14 +5,19 @@ import {
   callMcpTool,
   classifyMcpError,
   classifyToolRisk,
+  compactToolsForStorage,
   createMcpClientContext,
   discoverMcpTools,
   getMcpTools,
   mcpStateHeaders,
   readMcpState,
+  resolveDiscoveryFailure,
+  McpError,
   type McpServerConfig,
+  type McpToolInfo,
   MCP_MAX_TOOL_OUTPUT,
 } from './mcp';
+import { cookiePairByteLength } from './secrets';
 
 type MockMode = 'normal' | 'malformed' | 'error' | 'hang' | 'large' | 'unauthorized' | 'oauth-required';
 
@@ -318,8 +323,38 @@ describe('MCP Streamable HTTP client', () => {
       }),
     ).catch((error: unknown) => error);
 
-    expect(classifyMcpError(withBearer).code).toBe('http_401');
-    expect(classifyMcpError(withBearer).message).toContain('401');
+    expect(classifyMcpError(withBearer, 'connect', true).code).toBe('invalid_bearer_token');
+    expect(classifyMcpError(withBearer, 'connect', true).message).toMatch(/401|bearer/i);
+  });
+
+  it('does not promote GitHub remote MCP 401s into an OAuth flow', () => {
+    const github = { authMode: 'authless' as const, url: 'https://api.githubcopilot.com/mcp/' };
+    const challenge = new McpError('http_401', 'The MCP server answered HTTP 401 (authentication required).');
+    const withoutPat = resolveDiscoveryFailure(github, challenge, false);
+
+    expect(withoutPat.authMode).toBe('bearer');
+    expect(withoutPat.status).toBe('auth_required');
+    expect(withoutPat.statusCode).toBe('http_401');
+    expect(withoutPat.statusHint).toMatch(/PAT/);
+
+    const rejectedPat = resolveDiscoveryFailure(
+      { authMode: 'bearer', url: 'https://api.githubcopilot.com/mcp/x/all' },
+      challenge,
+      true,
+    );
+
+    expect(rejectedPat.authMode).toBe('bearer');
+    expect(rejectedPat.status).toBe('error');
+    expect(rejectedPat.statusCode).toBe('invalid_bearer_token');
+
+    const generic = resolveDiscoveryFailure(
+      { authMode: 'authless', url: 'https://mcp.example.com/mcp' },
+      new McpError('oauth_required', 'needs oauth'),
+      false,
+    );
+
+    expect(generic.authMode).toBe('oauth');
+    expect(generic.status).toBe('auth_required');
   });
 
   it('classifies malformed responses and transport failures', async () => {
@@ -342,6 +377,16 @@ describe('MCP Streamable HTTP client', () => {
     expect(classifyMcpError(new Error('Unsupported protocol version'), 'connect').code).toBe(
       'protocol_negotiation_failed',
     );
+    expect(
+      classifyMcpError(new Error('Incompatible auth server: does not support dynamic client registration')).code,
+    ).toBe('oauth_required');
+    expect(
+      classifyMcpError(
+        new Error('Incompatible auth server: does not support dynamic client registration'),
+        'connect',
+        true,
+      ).code,
+    ).toBe('invalid_bearer_token');
   });
 
   it('signs server configuration so a tampered cookie cannot redirect a credential', async () => {
@@ -501,5 +546,58 @@ describe('MCP Streamable HTTP client', () => {
     ]) {
       expect(() => assertSafeAuthorizationUrl(unsafe)).toThrow(/authorization URL/);
     }
+  });
+
+  it('persists a 50-tool GitHub-sized catalog without writing a cookie over 4 KiB', async () => {
+    const description =
+      'A realistic GitHub MCP tool description that explains repository, issue and pull-request operations in enough detail to blow past a 4 KiB cookie when fifty copies sit next to nine-field JSON Schemas. '.repeat(
+        2,
+      );
+    const tools: McpToolInfo[] = Array.from({ length: 50 }, (_, index) => ({
+      name: `github_tool_${index}_create_or_update_file`,
+      description: description.slice(0, 480),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          owner: { type: 'string' },
+          repo: { type: 'string' },
+          path: { type: 'string' },
+          content: { type: 'string' },
+          message: { type: 'string' },
+          branch: { type: 'string' },
+          sha: { type: 'string' },
+          committer: { type: 'object' },
+          author: { type: 'object' },
+        },
+        required: ['owner', 'repo', 'path', 'content', 'message'],
+      },
+      risk: index % 5 === 0 ? 'destructive' : index % 2 === 0 ? 'write' : 'read',
+    }));
+    const secret = 'unit-test-secret-value-32-chars!!';
+    const server = config('https://api.githubcopilot.com/mcp/', { tools, name: 'GitHub', authMode: 'bearer' });
+    const cookies = await mcpStateHeaders(
+      [server],
+      { [server.id]: 'github_pat_not_in_cookie' },
+      { MCP_COOKIE_SECRET: secret },
+    );
+    const live = cookies.filter((cookie) => !cookie.includes('Max-Age=0'));
+
+    for (const cookie of live) {
+      expect(cookiePairByteLength(cookie)).toBeLessThanOrEqual(4096);
+    }
+
+    const request = new Request('http://localhost/api/mcp', {
+      headers: { Cookie: live.map((cookie) => cookie.split(';')[0]).join('; ') },
+    });
+    const state = await readMcpState(request, { MCP_COOKIE_SECRET: secret });
+
+    expect(state.servers).toHaveLength(1);
+    expect(state.servers[0].tools).toHaveLength(50);
+    expect(state.servers[0].tools.map((tool) => tool.name)).toEqual(tools.map((tool) => tool.name));
+    expect(JSON.stringify(state.servers[0].tools[0].inputSchema)).toBe(
+      JSON.stringify(compactToolsForStorage(tools)[0].inputSchema),
+    );
+    expect(live.join('\n')).not.toContain('github_pat_not_in_cookie');
+    expect(state.secrets[server.id]).toBe('github_pat_not_in_cookie');
   });
 });
