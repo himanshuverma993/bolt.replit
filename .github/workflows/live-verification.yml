@@ -213,6 +213,88 @@ jobs:
           });
           NODE
 
+      - name: Worker connects to GitHub remote MCP with the Actions token
+        if: ${{ steps.target.outputs.is_production == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ steps.target.outputs.base }}
+        run: |
+          set -uo pipefail
+          node <<'NODE'
+          function redact(value) {
+            return String(value)
+              .replace(/\b(gh[pousr]_[A-Za-z0-9_-]{10,})/g, '[redacted]')
+              .replace(/\b(github_pat_[A-Za-z0-9_-]{10,})/g, '[redacted]')
+              .replace(/Bearer\s+[^\s]+/gi, 'Bearer [redacted]');
+          }
+          (async () => {
+            const base = process.env.BASE;
+            const token = process.env.GH_TOKEN;
+            if (!base || !token) {
+              console.log('::error::BASE or GH_TOKEN missing');
+              process.exit(1);
+            }
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 60000);
+            let response;
+            try {
+              response = await fetch(`${base}/api/mcp`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Origin: base,
+                  'Accept-Encoding': 'identity',
+                },
+                body: JSON.stringify({
+                  action: 'add',
+                  name: 'github-live-pat',
+                  url: 'https://api.githubcopilot.com/mcp/',
+                  token,
+                }),
+                signal: controller.signal,
+              });
+            } finally {
+              clearTimeout(timer);
+            }
+            const raw = redact(await response.text());
+            if (raw.includes(token) || /gh[pousr]_|github_pat_/.test(raw)) {
+              console.log('::error::Worker GitHub MCP response exposed token material');
+              process.exit(2);
+            }
+            let body;
+            try { body = JSON.parse(raw); } catch {
+              console.log(`::error::Worker GitHub MCP response was not JSON (HTTP ${response.status}) :: ${raw.slice(0, 200)}`);
+              process.exit(3);
+            }
+            const server = body.server || {};
+            const tools = Array.isArray(server.tools) ? server.tools : [];
+            const names = tools.map((tool) => tool.name).filter(Boolean).slice(0, 8);
+            const note = `HTTP ${response.status} status=${server.status} authMode=${server.authMode} code=${server.statusCode || 'none'} tools=${tools.length} :: ${names.join(', ')} :: ${String(server.statusMessage || '').slice(0, 160)}`;
+            console.log(note);
+            if (response.status === 501) {
+              console.log(`::notice::preview cannot store a PAT without APP_ENCRYPTION_SECRET (${note})`);
+              process.exit(0);
+            }
+            if (response.status !== 200) {
+              console.log(`::error::Worker GitHub MCP add with token returned HTTP ${response.status} :: ${note}`);
+              process.exit(4);
+            }
+            if (server.status === 'connected' && tools.length > 0) {
+              console.log(`::notice::Worker connected to GitHub remote MCP with a PAT and discovered ${tools.length} tool(s): ${names.join(', ')}`);
+              process.exit(0);
+            }
+            if (server.status === 'connected' && tools.length === 0) {
+              console.log(`::error::GitHub MCP connected with 0 tools after a PAT (cookie/catalog bug) :: ${note}`);
+              process.exit(5);
+            }
+            console.log(`::error::Worker did not connect GitHub remote MCP with a PAT :: ${note}`);
+            process.exit(6);
+          })().catch((error) => {
+            console.log(`::error::Worker GitHub PAT probe crashed :: ${redact(error instanceof Error ? error.message : String(error))}`);
+            process.exit(1);
+          });
+          NODE
+
       - name: Worker classifies GitHub remote MCP as PAT/bearer, never silent-connected
         if: ${{ steps.target.outputs.is_production == 'false' }}
         run: |
@@ -255,6 +337,7 @@ jobs:
             }
             console.log(`::notice::GitHub remote MCP was refused without a PAT and stayed on the bearer path (${note})`);
           '
+
 
       - name: Real Workers AI inference through /api/chat (Cloudflare provider, env.AI.run)
         run: |

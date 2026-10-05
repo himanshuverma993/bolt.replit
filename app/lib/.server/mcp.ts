@@ -205,6 +205,20 @@ function classifyRawMessage(message: string, hasBearerToken: boolean): McpError 
     );
   }
 
+  if (/incompatible auth server|dynamic client registration/i.test(message)) {
+    return hasBearerToken
+      ? new McpError(
+          'invalid_bearer_token',
+          'The MCP server rejected the bearer token (HTTP 401).',
+          'Check that the token is valid and not expired, then reconnect the server.',
+        )
+      : new McpError(
+          'oauth_required',
+          'This MCP server requires authentication and does not support dynamic client registration.',
+          'Use a bearer token (GitHub: a PAT). OAuth needs a GitHub App registered by this host.',
+        );
+  }
+
   if (/405|not acceptable|unsupported media|content-type/i.test(message)) {
     return new McpError(
       'unsupported_transport',
@@ -720,7 +734,16 @@ async function withMcpClient<T>(
     },
   };
 
-  if (context.oauth) {
+  /*
+   * GitHub's remote MCP is PAT/bearer. Attaching the SDK OAuth provider makes a
+   * 401 kick off RFC 7591 dynamic client registration, which GitHub does not
+   * support ("Incompatible auth server"), and the UI then looks like a generic
+   * unknown failure instead of "paste a PAT".
+   */
+  const catalogAuth = catalogAuthForUrl(server.url);
+  const skipOAuthProvider = Boolean(context.bearerToken) || server.authMode === 'bearer' || catalogAuth === 'bearer';
+
+  if (context.oauth && !skipOAuthProvider) {
     transportOptions.authProvider = transportAuthProvider({
       store: context.oauth.store,
       serverId: context.serverId,

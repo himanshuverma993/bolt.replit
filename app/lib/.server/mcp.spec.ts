@@ -377,6 +377,16 @@ describe('MCP Streamable HTTP client', () => {
     expect(classifyMcpError(new Error('Unsupported protocol version'), 'connect').code).toBe(
       'protocol_negotiation_failed',
     );
+    expect(
+      classifyMcpError(new Error('Incompatible auth server: does not support dynamic client registration')).code,
+    ).toBe('oauth_required');
+    expect(
+      classifyMcpError(
+        new Error('Incompatible auth server: does not support dynamic client registration'),
+        'connect',
+        true,
+      ).code,
+    ).toBe('invalid_bearer_token');
   });
 
   it('signs server configuration so a tampered cookie cannot redirect a credential', async () => {
