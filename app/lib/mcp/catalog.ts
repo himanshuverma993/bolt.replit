@@ -26,6 +26,13 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     note: 'Cloudflare’s official MCP server. Interactive clients sign in with OAuth; automation can use a scoped Cloudflare API token as a bearer token.',
   },
   {
+    id: 'github',
+    name: 'GitHub',
+    url: 'https://api.githubcopilot.com/mcp/',
+    auth: 'bearer',
+    note: 'GitHub’s official remote MCP server (https://api.githubcopilot.com/mcp/). Paste a PAT as the bearer token. Fine-grained: Contents read & write, Metadata read, and Administration read & write to create repos. Classic: repo scope. To load fewer tools, use a toolset URL such as https://api.githubcopilot.com/mcp/x/repos,issues,pull_requests,users,context (see GitHub remote-server docs). OAuth requires a GitHub App registered by this host — PAT is the supported path here.',
+  },
+  {
     id: 'figma',
     name: 'Figma',
     url: 'https://mcp.figma.com/mcp',

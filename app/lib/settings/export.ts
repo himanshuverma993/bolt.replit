@@ -31,6 +31,7 @@ export const FORBIDDEN_SETTINGS_KEYS = [
   'gh_session',
   'mcpSecrets',
   'mcp_oauth',
+  'mcpServers',
   'mcpSecrets'.toLowerCase(),
   'access_token',
   'refresh_token',
@@ -38,7 +39,8 @@ export const FORBIDDEN_SETTINGS_KEYS = [
   'authorization',
 ] as const;
 
-const FORBIDDEN_KEY_PATTERN = /(token|secret|password|credential|api[_-]?key|authorization|cookie|session)/i;
+const FORBIDDEN_KEY_PATTERN =
+  /(token|secret|password|credential|api[_-]?key|authorization|cookie|session|^mcp_oauth|^mcpSecrets|^mcpServers)/i;
 
 const CREDENTIAL_VALUE_PATTERN =
   /\b(gh[pousr]_[A-Za-z0-9_-]{10,}|github_pat_[A-Za-z0-9_-]{10,}|Bearer\s+[A-Za-z0-9._-]{10,})\b/;

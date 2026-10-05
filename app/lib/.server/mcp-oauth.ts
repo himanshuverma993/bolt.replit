@@ -10,9 +10,13 @@
  * (`beginAuthorization`, `completeAuthorization`).
  *
  * Storage: every server's tokens, client registration, PKCE verifier, state and
- * discovery cache live in one AES-256-GCM sealed, HttpOnly, Secure,
- * SameSite=Lax cookie. The browser cannot read or modify it, and nothing is ever
- * written to a JavaScript-readable cookie, a URL, a log or a chat message.
+ * discovery cache are DEFLATE-compressed, AES-256-GCM sealed, then sharded
+ * across HttpOnly, Secure, SameSite=Lax cookies (`mcp_oauth`, `mcp_oauth_2`, …)
+ * so a Cloudflare JWT (often 800–2000+ chars) fits under the browser's ~4 KiB
+ * per-cookie limit. The browser cannot read or modify the shards, and nothing
+ * is ever written to a JavaScript-readable cookie, a URL, a log or a chat
+ * message. Server-side KV/DO is not used: preview deployments have an empty
+ * `[previews]` block, so extra bindings would not exist there.
  */
 
 import { auth, type OAuthClientProvider, type OAuthDiscoveryState } from '@modelcontextprotocol/sdk/client/auth.js';
@@ -23,6 +27,10 @@ import type {
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import {
   clearCookie,
+  clearShardedCookies,
+  cookieShardCount,
+  joinShardedCookie,
+  MAX_COOKIE_SHARDS,
   missingSecretMessage,
   openJsonPayload,
   readRequestCookies,
@@ -30,6 +38,8 @@ import {
   redactSecrets,
   sealJsonPayload,
   serializeCookie,
+  serializeShardedCookies,
+  COOKIE_VALUE_LIMIT_BYTES,
   signaturesMatch,
   type SecretEnvironment,
 } from '~/lib/.server/secrets';
@@ -38,7 +48,9 @@ export const MCP_OAUTH_COOKIE = 'mcp_oauth';
 export const MCP_OAUTH_MAX_AGE = 60 * 60 * 24 * 30;
 export const MCP_OAUTH_STATE_COOKIE = 'mcp_oauth_state';
 export const MCP_OAUTH_STATE_MAX_AGE = 60 * 10;
-export const MCP_OAUTH_COOKIE_LIMIT_BYTES = 3500;
+
+/** @deprecated Use COOKIE_VALUE_LIMIT_BYTES. Kept so existing imports keep compiling. */
+export const MCP_OAUTH_COOKIE_LIMIT_BYTES = COOKIE_VALUE_LIMIT_BYTES;
 
 export type McpOAuthEntry = {
   serverId: string;
@@ -85,7 +97,7 @@ export function isMcpOAuthConfigured(env: SecretEnvironment): boolean {
 
 export async function readOAuthStore(request: Request, env: SecretEnvironment): Promise<McpOAuthStore> {
   const secret = resolveAppSecret(env);
-  const raw = readRequestCookies(request)[MCP_OAUTH_COOKIE];
+  const raw = joinShardedCookie(readRequestCookies(request), MCP_OAUTH_COOKIE);
 
   if (!raw || !secret) {
     return {};
@@ -117,28 +129,36 @@ function pruneStore(store: McpOAuthStore): void {
   }
 }
 
+function oauthCookieAttributes(): { httpOnly: true; maxAge: number; sameSite: 'Lax' } {
+  return { httpOnly: true, maxAge: MCP_OAUTH_MAX_AGE, sameSite: 'Lax' };
+}
+
+function sealedFitsShards(sealed: string): boolean {
+  return cookieShardCount(sealed) <= MAX_COOKIE_SHARDS;
+}
+
 export async function oauthStoreHeaders(store: McpOAuthStore, env: SecretEnvironment): Promise<string[]> {
   const secret = resolveAppSecret(env);
 
   if (!secret) {
-    return [clearCookie(MCP_OAUTH_COOKIE, { httpOnly: true })];
+    return clearShardedCookies(MCP_OAUTH_COOKIE, { httpOnly: true });
   }
 
   pruneStore(store);
 
   if (Object.keys(store).length === 0) {
-    return [clearCookie(MCP_OAUTH_COOKIE, { httpOnly: true })];
+    return clearShardedCookies(MCP_OAUTH_COOKIE, { httpOnly: true });
   }
 
-  const fits = (value: string) => new TextEncoder().encode(value).byteLength <= MCP_OAUTH_COOKIE_LIMIT_BYTES;
   let sealed = await sealJsonPayload(store, secret.value);
 
-  if (!fits(sealed)) {
+  if (!sealedFitsShards(sealed)) {
     /*
      * Discovery metadata is a cache: the SDK re-runs RFC 9728/8414 discovery on
      * the next request, so dropping it costs one round trip and is always
      * preferable to losing the tokens (or failing the flow). Access tokens are
-     * often long JWTs, and the practical cookie limit is about 4 KiB.
+     * often long JWTs; compression barely helps them, so sharding is the real
+     * fix. Discovery is dropped only when even the sharded budget is exceeded.
      */
     for (const entry of Object.values(store)) {
       entry.discovery = undefined;
@@ -147,14 +167,14 @@ export async function oauthStoreHeaders(store: McpOAuthStore, env: SecretEnviron
     sealed = await sealJsonPayload(store, secret.value);
   }
 
-  if (!fits(sealed)) {
+  if (!sealedFitsShards(sealed)) {
     throw new McpOAuthError(
       'storage_limit',
       'MCP OAuth state is too large for secure cookie storage. Disconnect MCP servers you no longer use and reconnect the ones you need.',
     );
   }
 
-  return [serializeCookie(MCP_OAUTH_COOKIE, sealed, { httpOnly: true, maxAge: MCP_OAUTH_MAX_AGE, sameSite: 'Lax' })];
+  return serializeShardedCookies(MCP_OAUTH_COOKIE, sealed, oauthCookieAttributes());
 }
 
 export function emptyEntry(serverId: string, serverUrl: string): McpOAuthEntry {

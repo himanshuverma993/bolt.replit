@@ -1,6 +1,6 @@
 import * as RadixDialog from '@radix-ui/react-dialog';
 import { motion } from 'framer-motion';
-import { useState, type ReactElement } from 'react';
+import { useEffect, useState, type ReactElement } from 'react';
 import { classNames } from '~/utils/classNames';
 import { DialogTitle, dialogVariants, dialogBackdropVariants } from '~/components/ui/Dialog';
 import { IconButton } from '~/components/ui/IconButton';
@@ -13,18 +13,25 @@ import EventLogsTab from './event-logs/EventLogsTab';
 import ConnectionsTab from './connections/ConnectionsTab';
 import DataTab from './data/DataTab';
 
+export type SettingsTabType = 'data' | 'providers' | 'features' | 'debug' | 'event-logs' | 'connection';
+
 interface SettingsProps {
   open: boolean;
   onClose: () => void;
+  initialTab?: SettingsTabType;
 }
 
-type TabType = 'data' | 'providers' | 'features' | 'debug' | 'event-logs' | 'connection';
-
-export const SettingsWindow = ({ open, onClose }: SettingsProps) => {
+export const SettingsWindow = ({ open, onClose, initialTab }: SettingsProps) => {
   const { debug, eventLogs } = useSettings();
-  const [activeTab, setActiveTab] = useState<TabType>('data');
+  const [activeTab, setActiveTab] = useState<SettingsTabType>(initialTab ?? 'data');
 
-  const tabs: { id: TabType; label: string; icon: string; component?: ReactElement }[] = [
+  useEffect(() => {
+    if (initialTab) {
+      setActiveTab(initialTab);
+    }
+  }, [initialTab]);
+
+  const tabs: { id: SettingsTabType; label: string; icon: string; component?: ReactElement }[] = [
     { id: 'data', label: 'Data', icon: 'i-ph:database', component: <DataTab /> },
     { id: 'providers', label: 'Providers', icon: 'i-ph:key', component: <ProvidersTab /> },
     { id: 'connection', label: 'Connection', icon: 'i-ph:link', component: <ConnectionsTab /> },
@@ -32,7 +39,7 @@ export const SettingsWindow = ({ open, onClose }: SettingsProps) => {
     ...(debug
       ? [
           {
-            id: 'debug' as TabType,
+            id: 'debug' as SettingsTabType,
             label: 'Debug Tab',
             icon: 'i-ph:bug',
             component: <DebugTab />,
@@ -42,7 +49,7 @@ export const SettingsWindow = ({ open, onClose }: SettingsProps) => {
     ...(eventLogs
       ? [
           {
-            id: 'event-logs' as TabType,
+            id: 'event-logs' as SettingsTabType,
             label: 'Event Logs',
             icon: 'i-ph:list-bullets',
             component: <EventLogsTab />,

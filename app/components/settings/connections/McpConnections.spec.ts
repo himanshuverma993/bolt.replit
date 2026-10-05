@@ -105,6 +105,7 @@ describe('MCP connection panel', () => {
      * servers that would connect without authentication.
      */
     expect(screen.getByRole('button', { name: /Use Cloudflare.*\(OAuth required\)/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Use GitHub.*\(bearer\)/ })).toBeTruthy();
     expect(screen.getByRole('button', { name: /Use Figma.*\(OAuth required\)/ })).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: /Use Cloudflare/ }));
@@ -206,14 +207,23 @@ describe('MCP connection panel', () => {
   });
 
   it('reports an OAuth callback failure from the URL and strips the query parameters', async () => {
-    window.history.replaceState({}, '', '/?mcp_oauth=error&reason=missing_state_cookie&server=cloudflare-docs');
+    window.history.replaceState(
+      {},
+      '',
+      '/?settings=connection&mcp_oauth=error&reason=storage_limit&detail=MCP+OAuth+state+is+too+large+for+secure+cookie+storage.&server=cloudflare-docs',
+    );
     stubMcp({ servers: [] });
 
     render(element);
 
     await waitFor(() => expect(toastMock.error).toHaveBeenCalled());
-    expect(String(toastMock.error.mock.calls[0][0])).toContain('missing_state_cookie');
+    expect(String(toastMock.error.mock.calls[0][0])).toContain('storage_limit');
+    expect(String(toastMock.error.mock.calls[0][0])).toMatch(/too large/i);
     expect(window.location.search).toBe('');
+
+    const banner = await screen.findByRole('alert');
+    expect(banner.textContent).toContain('storage_limit');
+    expect(banner.textContent).toMatch(/too large/i);
   });
 
   it('warns when no credential secret exists and removes a server through the API', async () => {

@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'react-toastify';
 import { Dialog, DialogButton, DialogDescription, DialogRoot, DialogTitle } from '~/components/ui/Dialog';
 import { ThemeSwitch } from '~/components/ui/ThemeSwitch';
-import { SettingsWindow } from '~/components/settings/SettingsWindow';
+import { SettingsWindow, type SettingsTabType } from '~/components/settings/SettingsWindow';
 import { SettingsButton } from '~/components/ui/SettingsButton';
 import { db, deleteById, getAll, chatId, type ChatHistoryItem, useChatHistory } from '~/lib/persistence';
 import { cubicEasingFn } from '~/utils/easings';
@@ -61,6 +61,22 @@ export const Menu = () => {
   const [open, setOpen] = useState(false);
   const [dialogContent, setDialogContent] = useState<DialogContent>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTabType | undefined>();
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const settings = params.get('settings');
+    const oauth = params.get('mcp_oauth');
+
+    if (oauth || settings === 'connection') {
+      setSettingsTab('connection');
+      setIsSettingsOpen(true);
+    }
+  }, []);
 
   const { filteredItems: filteredList, handleSearchChange } = useSearchFilter({
     items: list,
@@ -226,7 +242,14 @@ export const Menu = () => {
           <ThemeSwitch />
         </div>
       </div>
-      <SettingsWindow open={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
+      <SettingsWindow
+        open={isSettingsOpen}
+        initialTab={settingsTab}
+        onClose={() => {
+          setIsSettingsOpen(false);
+          setSettingsTab(undefined);
+        }}
+      />
     </motion.div>
   );
 };

@@ -5,14 +5,17 @@ import {
   callMcpTool,
   classifyMcpError,
   classifyToolRisk,
+  compactToolsForStorage,
   createMcpClientContext,
   discoverMcpTools,
   getMcpTools,
   mcpStateHeaders,
   readMcpState,
   type McpServerConfig,
+  type McpToolInfo,
   MCP_MAX_TOOL_OUTPUT,
 } from './mcp';
+import { cookiePairByteLength } from './secrets';
 
 type MockMode = 'normal' | 'malformed' | 'error' | 'hang' | 'large' | 'unauthorized' | 'oauth-required';
 
@@ -501,5 +504,58 @@ describe('MCP Streamable HTTP client', () => {
     ]) {
       expect(() => assertSafeAuthorizationUrl(unsafe)).toThrow(/authorization URL/);
     }
+  });
+
+  it('persists a 50-tool GitHub-sized catalog without writing a cookie over 4 KiB', async () => {
+    const description =
+      'A realistic GitHub MCP tool description that explains repository, issue and pull-request operations in enough detail to blow past a 4 KiB cookie when fifty copies sit next to nine-field JSON Schemas. '.repeat(
+        2,
+      );
+    const tools: McpToolInfo[] = Array.from({ length: 50 }, (_, index) => ({
+      name: `github_tool_${index}_create_or_update_file`,
+      description: description.slice(0, 480),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          owner: { type: 'string' },
+          repo: { type: 'string' },
+          path: { type: 'string' },
+          content: { type: 'string' },
+          message: { type: 'string' },
+          branch: { type: 'string' },
+          sha: { type: 'string' },
+          committer: { type: 'object' },
+          author: { type: 'object' },
+        },
+        required: ['owner', 'repo', 'path', 'content', 'message'],
+      },
+      risk: index % 5 === 0 ? 'destructive' : index % 2 === 0 ? 'write' : 'read',
+    }));
+    const secret = 'unit-test-secret-value-32-chars!!';
+    const server = config('https://api.githubcopilot.com/mcp/', { tools, name: 'GitHub', authMode: 'bearer' });
+    const cookies = await mcpStateHeaders(
+      [server],
+      { [server.id]: 'github_pat_not_in_cookie' },
+      { MCP_COOKIE_SECRET: secret },
+    );
+    const live = cookies.filter((cookie) => !cookie.includes('Max-Age=0'));
+
+    for (const cookie of live) {
+      expect(cookiePairByteLength(cookie)).toBeLessThanOrEqual(4096);
+    }
+
+    const request = new Request('http://localhost/api/mcp', {
+      headers: { Cookie: live.map((cookie) => cookie.split(';')[0]).join('; ') },
+    });
+    const state = await readMcpState(request, { MCP_COOKIE_SECRET: secret });
+
+    expect(state.servers).toHaveLength(1);
+    expect(state.servers[0].tools).toHaveLength(50);
+    expect(state.servers[0].tools.map((tool) => tool.name)).toEqual(tools.map((tool) => tool.name));
+    expect(JSON.stringify(state.servers[0].tools[0].inputSchema)).toBe(
+      JSON.stringify(compactToolsForStorage(tools)[0].inputSchema),
+    );
+    expect(live.join('\n')).not.toContain('github_pat_not_in_cookie');
+    expect(state.secrets[server.id]).toBe('github_pat_not_in_cookie');
   });
 });

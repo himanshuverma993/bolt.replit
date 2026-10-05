@@ -1,17 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import {
   MIN_SECRET_LENGTH,
+  COOKIE_VALUE_LIMIT_BYTES,
+  MAX_COOKIE_SHARDS,
   clearCookie,
+  cookiePairByteLength,
+  cookieShardCount,
   decodeSignedCookieValue,
   encodeSignedCookieValue,
   isSameOriginRequest,
   isSecureOrigin,
+  joinShardedCookie,
   openJsonPayload,
   parseCookieHeader,
+  readRequestCookies,
   redactSecrets,
   resolveAppSecret,
   sealJsonPayload,
   serializeCookie,
+  serializeShardedCookies,
   signaturesMatch,
 } from './secrets';
 
@@ -28,9 +35,34 @@ describe('sealing', () => {
   it('round-trips a JSON payload through AES-256-GCM', async () => {
     const sealed = await sealJsonPayload({ token: 'ghp_example', nested: { a: 1 } }, SECRET);
 
-    expect(sealed.startsWith('v1.')).toBe(true);
+    expect(sealed.startsWith('v2.')).toBe(true);
     expect(sealed).not.toContain('ghp_example');
     await expect(openJsonPayload(sealed, SECRET)).resolves.toEqual({ token: 'ghp_example', nested: { a: 1 } });
+  });
+
+  it('still opens a legacy uncompressed v1 payload', async () => {
+    const encoder = new TextEncoder();
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const digest = await crypto.subtle.digest('SHA-256', encoder.encode(SECRET));
+    const key = await crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt']);
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      encoder.encode(JSON.stringify({ token: 'legacy-v1' })),
+    );
+    const packed = new Uint8Array(iv.byteLength + ciphertext.byteLength);
+    packed.set(iv);
+    packed.set(new Uint8Array(ciphertext), iv.byteLength);
+
+    let binary = '';
+
+    for (const byte of packed) {
+      binary += String.fromCharCode(byte);
+    }
+
+    const sealed = `v1.${btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')}`;
+
+    await expect(openJsonPayload(sealed, SECRET)).resolves.toEqual({ token: 'legacy-v1' });
   });
 
   it('returns undefined for a tampered value, a wrong key or a foreign payload', async () => {
@@ -63,6 +95,35 @@ describe('signed cookies', () => {
     expect(signaturesMatch('abcdef', 'abcdef')).toBe(true);
     expect(signaturesMatch('abcdef', 'abcdeF')).toBe(false);
     expect(signaturesMatch('abcdef', 'abcde')).toBe(false);
+  });
+});
+
+describe('cookie sharding', () => {
+  it('round-trips a payload larger than one cookie through named shards', () => {
+    const payload = 'a'.repeat(COOKIE_VALUE_LIMIT_BYTES * 2 + 50);
+    const headers = serializeShardedCookies('mcp_oauth', payload, { httpOnly: true, maxAge: 60 });
+    const live = headers.filter((header) => !header.includes('Max-Age=0'));
+
+    expect(live.length).toBe(cookieShardCount(payload));
+    expect(live[0].startsWith('mcp_oauth=')).toBe(true);
+    expect(live[1].startsWith('mcp_oauth_2=')).toBe(true);
+
+    for (const header of live) {
+      expect(cookiePairByteLength(header)).toBeLessThanOrEqual(4096);
+      expect(header).toContain('HttpOnly');
+    }
+
+    const request = new Request('https://bolt.example.test/', {
+      headers: { Cookie: live.map((header) => header.split(';')[0]).join('; ') },
+    });
+
+    expect(joinShardedCookie(readRequestCookies(request), 'mcp_oauth')).toBe(payload);
+  });
+
+  it('refuses to exceed the shard cap', () => {
+    expect(() =>
+      serializeShardedCookies('mcp_oauth', 'x'.repeat(COOKIE_VALUE_LIMIT_BYTES * MAX_COOKIE_SHARDS + 1)),
+    ).toThrow(/maximum is/);
   });
 });
 

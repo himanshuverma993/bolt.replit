@@ -68,7 +68,14 @@ function riskBadge(risk: McpToolRisk | undefined) {
   return 'text-bolt-elements-textSecondary';
 }
 
-function oauthResultFromUrl(): { status: 'success' | 'error'; reason?: string; server?: string } | undefined {
+function oauthResultFromUrl():
+  | {
+      status: 'success' | 'error';
+      reason?: string;
+      detail?: string;
+      server?: string;
+    }
+  | undefined {
   if (typeof window === 'undefined') {
     return undefined;
   }
@@ -83,6 +90,7 @@ function oauthResultFromUrl(): { status: 'success' | 'error'; reason?: string; s
   return {
     status,
     reason: params.get('reason') ?? undefined,
+    detail: params.get('detail') ?? undefined,
     server: params.get('server') ?? undefined,
   };
 }
@@ -96,6 +104,7 @@ export default function McpConnections() {
   const [token, setToken] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [oauthNotice, setOauthNotice] = useState(oauthResultFromUrl);
 
   const loadServers = async () => {
     try {
@@ -116,15 +125,21 @@ export default function McpConnections() {
 
     if (result?.status === 'success') {
       toast.success('MCP OAuth connection completed');
+      setOauthNotice(result);
     } else if (result) {
-      toast.error(`MCP OAuth failed${result.reason ? `: ${result.reason}` : ''}`);
+      toast.error(
+        `MCP OAuth failed${result.reason ? `: ${result.reason}` : ''}${result.detail ? ` — ${result.detail}` : ''}`,
+      );
+      setOauthNotice(result);
     }
 
     if (result) {
       const clean = new URL(window.location.href);
       clean.searchParams.delete('mcp_oauth');
       clean.searchParams.delete('reason');
+      clean.searchParams.delete('detail');
       clean.searchParams.delete('server');
+      clean.searchParams.delete('settings');
       window.history.replaceState({}, '', clean.toString());
     }
 
@@ -248,6 +263,29 @@ export default function McpConnections() {
         <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-300">
           No credential secret is configured, so bearer and OAuth credentials cannot be stored. Set{' '}
           <code>APP_ENCRYPTION_SECRET</code> (or <code>MCP_COOKIE_SECRET</code>) as a Worker secret.
+        </div>
+      )}
+
+      {oauthNotice?.status === 'error' && (
+        <div role="alert" className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-300">
+          <div className="flex items-start justify-between gap-2">
+            <p>
+              MCP OAuth failed{oauthNotice.reason ? `: ${oauthNotice.reason}` : ''}
+              {oauthNotice.detail ? ` — ${oauthNotice.detail}` : ''}
+            </p>
+            <button type="button" className="shrink-0 underline" onClick={() => setOauthNotice(undefined)}>
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
+      {oauthNotice?.status === 'success' && (
+        <div
+          role="status"
+          className="mb-4 rounded-md border border-green-500/40 bg-green-500/10 p-3 text-xs text-green-300"
+        >
+          MCP OAuth connection completed.
         </div>
       )}
 

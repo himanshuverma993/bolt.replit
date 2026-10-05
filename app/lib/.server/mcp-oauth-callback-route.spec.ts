@@ -65,6 +65,7 @@ describe('GET /api/mcp/oauth/callback', () => {
 
     expect(response.status).toBe(302);
     expect(location.pathname).toBe('/');
+    expect(location.searchParams.get('settings')).toBe('connection');
     expect(location.searchParams.get('mcp_oauth')).toBe('error');
     expect(location.searchParams.get('reason')).toBe('missing_state_cookie');
     expect(response.headers.getSetCookie().some((cookie) => cookie.startsWith(`${MCP_OAUTH_STATE_COOKIE}=`))).toBe(
@@ -117,6 +118,8 @@ describe('GET /api/mcp/oauth/callback', () => {
 
     expect(response.status).toBe(302);
     expect(location.searchParams.get('reason')).toBe('state_mismatch');
+    expect(location.searchParams.get('settings')).toBe('connection');
+    expect(location.searchParams.get('detail')).toMatch(/state parameter/i);
     expect(mockState.tokenRequests).toBe(before);
     expect(location.toString()).not.toMatch(/access-|refresh-/);
   });
@@ -145,6 +148,7 @@ describe('GET /api/mcp/oauth/callback', () => {
     const oauthCookie = setCookies.find((cookie) => cookie.startsWith(`${MCP_OAUTH_COOKIE}=`));
 
     expect(response.status).toBe(302);
+    expect(location.searchParams.get('settings')).toBe('connection');
     expect(location.searchParams.get('mcp_oauth')).toBe('success');
     expect(oauthCookie).toBeDefined();
     expect(oauthCookie).toContain('HttpOnly');

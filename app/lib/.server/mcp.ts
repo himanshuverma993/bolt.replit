@@ -6,21 +6,24 @@
  *
  * Security model
  * --------------
- *  - Server *configuration* (names, URLs, enabled flag, tool list) is stored in
- *    the `mcpServers` cookie. When a Worker secret is configured that cookie is
- *    HMAC signed, so a client cannot rewrite a stored server URL and make Bolt
- *    send an existing credential to an attacker-controlled host.
+ *  - Server *configuration* (names, URLs, enabled flag, compact tool catalog)
+ *    is stored in the `mcpServers` cookie. When a Worker secret is configured
+ *    that cookie is HMAC signed, so a client cannot rewrite a stored server URL
+ *    and make Bolt send an existing credential to an attacker-controlled host.
+ *    Full JSON Schemas are not persisted (they exceed the browser's ~4 KiB
+ *    cookie limit for GitHub-sized catalogs); chat rediscovers them live.
+ *    Oversized cookies are sharded (`mcpServers_2`, …).
  *  - Credentials (bearer tokens, OAuth tokens, PKCE verifiers, client
  *    registrations) live in separate AES-256-GCM sealed, HttpOnly, Secure
- *    cookies. Page JavaScript can neither read nor forge them.
+ *    cookies (also sharded). Page JavaScript can neither read nor forge them.
  *  - Cookies written by the previous implementation (unsigned config, opaque
  *    secrets cookie without a signature) are dropped and reported to the UI
  *    instead of being trusted.
  *  - Destructive/write tools require an explicit per-server opt-in; the
  *    decision is enforced on the server, not in the model prompt.
  *
- * Limits are unchanged from the previous version: 10 s per request, 16 KiB tool
- * output, 3 tool-loop steps, 12 KiB of public server state.
+ * Limits: 10 s per request, 16 KiB tool output, 3 tool-loop steps, and no
+ * cookie larger than ~3.5 KiB (browser limit).
  */
 
 import { Client, type ClientOptions } from '@modelcontextprotocol/sdk/client/index.js';
@@ -28,17 +31,20 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { CfWorkerJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/cfworker';
 import { jsonSchema, tool, type CoreTool } from 'ai';
 import {
-  clearCookie,
+  clearShardedCookies,
+  cookieShardCount,
   decodeSignedCookieValue,
   encodeSignedCookieValue,
   getRequestOrigin,
   isSecureOrigin,
+  joinShardedCookie,
+  MAX_COOKIE_SHARDS,
   openJsonPayload,
   readRequestCookies,
   redactSecrets,
   resolveAppSecret,
   sealJsonPayload,
-  serializeCookie,
+  serializeShardedCookies,
   type SecretEnvironment,
 } from '~/lib/.server/secrets';
 import {
@@ -56,8 +62,11 @@ export const MCP_COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
 export const MCP_REQUEST_TIMEOUT_MS = 10_000;
 export const MCP_MAX_TOOL_OUTPUT = 16 * 1024;
 export const MCP_MAX_STEPS = 3;
-export const MCP_MAX_PUBLIC_COOKIE_BYTES = 12 * 1024;
+
+/** @deprecated Per-cookie limit is COOKIE_VALUE_LIMIT_BYTES; total budget is shards × that. */
+export const MCP_MAX_PUBLIC_COOKIE_BYTES = 3500 * 8;
 export const MCP_TOOL_DESCRIPTION_LIMIT = 500;
+export const MCP_STORED_DESCRIPTION_LIMIT = 160;
 
 export type McpToolInfo = {
   name: string;
@@ -404,6 +413,34 @@ function normalizeToolInfo(toolInfo: { name: string; description?: string; input
   };
 }
 
+const EMPTY_INPUT_SCHEMA: Record<string, unknown> = { type: 'object', properties: {} };
+
+export type ToolCatalogCompactness = 'schema-stripped' | 'names-only' | 'metadata-only';
+
+/**
+ * Cookie-safe tool catalog. Full JSON Schemas (GitHub MCP: 40–90 tools × 9-field
+ * schemas) cannot fit in a browser cookie even when sharded. Chat rediscovers
+ * live schemas via {@link getMcpTools}.
+ */
+export function compactToolsForStorage(
+  tools: McpToolInfo[],
+  mode: Exclude<ToolCatalogCompactness, 'metadata-only'> = 'schema-stripped',
+): McpToolInfo[] {
+  return tools.map((tool) => ({
+    name: tool.name,
+    description: mode === 'names-only' ? undefined : tool.description?.slice(0, MCP_STORED_DESCRIPTION_LIMIT),
+    inputSchema: EMPTY_INPUT_SCHEMA,
+    risk: tool.risk,
+  }));
+}
+
+function serversForCookie(servers: McpServerConfig[], compactness: ToolCatalogCompactness): McpServerConfig[] {
+  return servers.map((server) => ({
+    ...server,
+    tools: compactness === 'metadata-only' ? [] : compactToolsForStorage(server.tools, compactness),
+  }));
+}
+
 function parseStoredServers(raw: string, trusted: boolean): McpServerConfig[] {
   let parsed: unknown;
 
@@ -466,15 +503,16 @@ export async function readMcpState(request: Request, env: SecretEnvironment): Pr
   const secret = resolveAppSecret(env);
   const warnings: string[] = [];
   let servers: McpServerConfig[] = [];
+  const publicRaw = joinShardedCookie(cookies, MCP_PUBLIC_COOKIE);
 
-  if (cookies[MCP_PUBLIC_COOKIE]) {
+  if (publicRaw) {
     if (secret) {
-      const unsigned = await decodeSignedCookieValue(cookies[MCP_PUBLIC_COOKIE], secret.value);
+      const unsigned = await decodeSignedCookieValue(publicRaw, secret.value);
 
       if (unsigned) {
         servers = parseStoredServers(unsigned, true);
       } else {
-        const legacy = parseStoredServers(cookies[MCP_PUBLIC_COOKIE], false);
+        const legacy = parseStoredServers(publicRaw, false);
 
         if (legacy.length > 0) {
           warnings.push(
@@ -483,7 +521,7 @@ export async function readMcpState(request: Request, env: SecretEnvironment): Pr
         }
       }
     } else {
-      const unsignedServers = parseStoredServers(cookies[MCP_PUBLIC_COOKIE], false);
+      const unsignedServers = parseStoredServers(publicRaw, false);
 
       if (unsignedServers.length > 0) {
         warnings.push(
@@ -495,8 +533,9 @@ export async function readMcpState(request: Request, env: SecretEnvironment): Pr
   }
 
   let secrets: McpSecretState = {};
+  const secretRaw = joinShardedCookie(cookies, MCP_SECRET_COOKIE);
 
-  if (cookies[MCP_SECRET_COOKIE]) {
+  if (secretRaw) {
     if (!secret) {
       if (servers.some((server) => server.enabled)) {
         warnings.push(
@@ -504,7 +543,7 @@ export async function readMcpState(request: Request, env: SecretEnvironment): Pr
         );
       }
     } else {
-      const decrypted = await openJsonPayload<McpSecretState>(cookies[MCP_SECRET_COOKIE], secret.value);
+      const decrypted = await openJsonPayload<McpSecretState>(secretRaw, secret.value);
 
       if (decrypted && typeof decrypted === 'object' && !Array.isArray(decrypted)) {
         secrets = decrypted;
@@ -521,47 +560,65 @@ export async function readMcpState(request: Request, env: SecretEnvironment): Pr
   return { servers, secrets, oauth, warnings };
 }
 
-/** Set-Cookie headers that persist MCP state (optionally with fresh OAuth state). */
+async function encodePublicCookieValue(servers: McpServerConfig[], secretValue?: string): Promise<string> {
+  const publicValue = JSON.stringify(servers);
+
+  return secretValue ? encodeSignedCookieValue(publicValue, secretValue) : publicValue;
+}
+
+/**
+ * Persist MCP state. Tool catalogs are compacted (no JSON Schemas) and cookies
+ * are sharded so each Set-Cookie value stays under the browser's ~4 KiB limit.
+ */
 export async function mcpStateHeaders(
   servers: McpServerConfig[],
   secrets: McpSecretState,
   env: SecretEnvironment,
   oauth?: McpOAuthStore,
 ): Promise<string[]> {
-  const publicValue = JSON.stringify(servers);
-  const headers: string[] = [];
+  const secret = resolveAppSecret(env);
+  const compactnessLevels: ToolCatalogCompactness[] = ['schema-stripped', 'names-only', 'metadata-only'];
+  let encodedPublic: string | undefined;
 
-  if (new TextEncoder().encode(publicValue).byteLength > MCP_MAX_PUBLIC_COOKIE_BYTES) {
+  for (const compactness of compactnessLevels) {
+    const candidate = await encodePublicCookieValue(serversForCookie(servers, compactness), secret?.value);
+
+    if (cookieShardCount(candidate) <= MAX_COOKIE_SHARDS) {
+      encodedPublic = candidate;
+      break;
+    }
+  }
+
+  if (!encodedPublic) {
     throw new McpError(
       'invalid_request',
       'MCP configuration is too large for cookie storage; remove unused servers or refresh their tool lists.',
     );
   }
 
-  const secret = resolveAppSecret(env);
-
-  if (secret) {
-    headers.push(
-      serializeCookie(MCP_PUBLIC_COOKIE, await encodeSignedCookieValue(publicValue, secret.value), {
-        maxAge: MCP_COOKIE_MAX_AGE,
-      }),
-    );
-  } else {
-    headers.push(serializeCookie(MCP_PUBLIC_COOKIE, publicValue, { maxAge: MCP_COOKIE_MAX_AGE }));
-  }
+  const headers: string[] = [
+    ...serializeShardedCookies(MCP_PUBLIC_COOKIE, encodedPublic, { maxAge: MCP_COOKIE_MAX_AGE }),
+  ];
 
   if (Object.keys(secrets).length > 0) {
     const sealed = await sealJsonPayload(secrets, requireOAuthSecret(env));
 
+    if (cookieShardCount(sealed) > MAX_COOKIE_SHARDS) {
+      throw new McpError(
+        'invalid_request',
+        'MCP credentials are too large for secure cookie storage; remove unused servers.',
+      );
+    }
+
     headers.push(
-      serializeCookie(MCP_SECRET_COOKIE, sealed, {
+      ...serializeShardedCookies(MCP_SECRET_COOKIE, sealed, {
         httpOnly: true,
         maxAge: MCP_COOKIE_MAX_AGE,
         sameSite: 'Lax',
       }),
     );
   } else {
-    headers.push(clearCookie(MCP_SECRET_COOKIE, { httpOnly: true }));
+    headers.push(...clearShardedCookies(MCP_SECRET_COOKIE, { httpOnly: true }));
   }
 
   if (oauth) {
@@ -834,7 +891,7 @@ export async function getMcpTools(
     return {};
   }
 
-  const enabled = state.servers.filter((server) => server.enabled && server.tools.length > 0);
+  const enabled = state.servers.filter((server) => server.enabled);
 
   if (enabled.length === 0) {
     return {};
@@ -842,18 +899,41 @@ export async function getMcpTools(
 
   const tools: Record<string, CoreTool> = {};
   const usedNames = new Set<string>();
+  const resolved = await Promise.all(
+    enabled.map(async (server) => {
+      const context = createMcpClientContext({
+        request,
+        env,
+        serverId: server.id,
+        bearerToken: state.secrets[server.id],
+        oauthStore: state.oauth,
+        clientMetadataUrl,
+      });
 
-  for (const server of enabled) {
-    const context = createMcpClientContext({
-      request,
-      env,
-      serverId: server.id,
-      bearerToken: state.secrets[server.id],
-      oauthStore: state.oauth,
-      clientMetadataUrl,
-    });
+      /*
+       * Cookie storage keeps a compact catalog (names/risk, no JSON Schemas).
+       * Rediscover live schemas for the model; fall back to the stored list if
+       * the remote server is briefly unreachable so a chat is not stripped of
+       * tools mid-session.
+       */
+      let catalog = server.tools;
 
-    for (const toolInfo of server.tools) {
+      try {
+        catalog = await discoverMcpTools(server, context, 'list');
+      } catch {
+        catalog = server.tools;
+      }
+
+      return { server: { ...server, tools: catalog }, context, catalog };
+    }),
+  );
+
+  for (const { server, context, catalog } of resolved) {
+    if (catalog.length === 0) {
+      continue;
+    }
+
+    for (const toolInfo of catalog) {
       const baseName = `mcp_${toolNamePart(server.name)}_${toolNamePart(toolInfo.name)}`;
       let name = baseName;
       let suffix = 2;

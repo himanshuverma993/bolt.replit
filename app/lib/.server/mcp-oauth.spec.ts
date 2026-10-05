@@ -8,7 +8,6 @@ import {
   beginMcpAuthorization,
   completeMcpAuthorization,
   hasStoredTokens,
-  MCP_OAUTH_COOKIE_LIMIT_BYTES,
   oauthStateCookie,
   oauthStoreHeaders,
   readOAuthStore,
@@ -18,6 +17,7 @@ import {
   McpOAuthError,
   type McpOAuthStore,
 } from './mcp-oauth';
+import { COOKIE_VALUE_LIMIT_BYTES, cookiePairByteLength, MAX_COOKIE_SHARDS } from './secrets';
 import { createMcpClientContext, discoverMcpTools, mcpStateHeaders, readMcpState } from './mcp';
 import {
   closeOAuthMockServers,
@@ -208,7 +208,8 @@ describe('MCP OAuth client', () => {
     });
 
     const cookies = await oauthStoreHeaders(store, { APP_ENCRYPTION_SECRET: SECRET });
-    const oauthCookie = cookies.find((cookie) => cookie.startsWith('mcp_oauth='))!;
+    const live = cookies.filter((cookie) => cookie.startsWith('mcp_oauth') && !cookie.includes('Max-Age=0'));
+    const oauthCookie = live.find((cookie) => cookie.startsWith('mcp_oauth='))!;
     const accessToken = store['oauth-server'].tokens!.access_token!;
 
     expect(oauthCookie).toContain('HttpOnly');
@@ -216,20 +217,75 @@ describe('MCP OAuth client', () => {
     expect(oauthCookie).not.toContain(accessToken);
 
     const request = new Request('http://localhost/api/mcp', {
-      headers: { Cookie: oauthCookie.split(';')[0] },
+      headers: { Cookie: live.map((cookie) => cookie.split(';')[0]).join('; ') },
     });
     const restored = await readOAuthStore(request, { APP_ENCRYPTION_SECRET: SECRET });
 
     expect(restored['oauth-server'].tokens?.access_token).toBe(accessToken);
   });
 
+  it('round-trips a 1885-character JWT-shaped access token through compressed sharded cookies', async () => {
+    const accessToken = `eyJ${'A'.repeat(1882)}`;
+    const store: McpOAuthStore = {
+      'oauth-server': {
+        serverId: 'oauth-server',
+        serverUrl: 'https://mcp.cloudflare.com/mcp',
+        tokens: {
+          access_token: accessToken,
+          refresh_token: `refresh-${'r'.repeat(200)}`,
+          token_type: 'Bearer',
+          expires_in: 3600,
+        },
+        clientInformation: {
+          client_id: 'cloudflare-mcp-client',
+          client_id_issued_at: 1_700_000_000,
+          token_endpoint_auth_method: 'none',
+        },
+        updatedAt: new Date().toISOString(),
+      },
+    };
+
+    const cookies = await oauthStoreHeaders(store, { APP_ENCRYPTION_SECRET: SECRET });
+    const live = cookies.filter((cookie) => cookie.startsWith('mcp_oauth') && !cookie.includes('Max-Age=0'));
+
+    expect(live.length).toBeGreaterThanOrEqual(1);
+
+    for (const cookie of live) {
+      expect(cookiePairByteLength(cookie)).toBeLessThanOrEqual(4096);
+      expect(cookie).toContain('HttpOnly');
+      expect(cookie).not.toContain(accessToken);
+    }
+
+    const restored = await readOAuthStore(
+      new Request('https://bolt.example.test/api/mcp', {
+        headers: { Cookie: live.map((cookie) => cookie.split(';')[0]).join('; ') },
+      }),
+      { APP_ENCRYPTION_SECRET: SECRET },
+    );
+
+    expect(restored['oauth-server'].tokens?.access_token).toBe(accessToken);
+    expect(restored['oauth-server'].tokens?.access_token).toHaveLength(1885);
+  });
+
   it('rejects oversized OAuth state instead of silently dropping credentials', async () => {
+    /*
+     * Repeated characters deflate to almost nothing, so the payload has to look
+     * like a real JWT (high entropy) to actually overflow the shard budget.
+     */
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const bytes = crypto.getRandomValues(new Uint8Array(COOKIE_VALUE_LIMIT_BYTES * MAX_COOKIE_SHARDS + 8_000));
+    let accessToken = '';
+
+    for (const byte of bytes) {
+      accessToken += alphabet[byte % alphabet.length];
+    }
+
     const store: McpOAuthStore = {
       'oauth-server': {
         serverId: 'oauth-server',
         serverUrl: 'https://mcp.example.com/mcp',
         tokens: {
-          access_token: 'x'.repeat(MCP_OAUTH_COOKIE_LIMIT_BYTES + 500),
+          access_token: accessToken,
           token_type: 'Bearer',
         },
         updatedAt: new Date().toISOString(),
@@ -241,29 +297,29 @@ describe('MCP OAuth client', () => {
     });
   });
 
-  it('drops the discovery cache instead of failing when the sealed store is too large', async () => {
+  it('keeps tokens when discovery metadata is large enough that a single cookie would overflow', async () => {
     /*
-     * Discovery metadata is re-fetched automatically, tokens are not. Access
-     * tokens are often long JWTs, so the cache is evicted before the flow fails.
+     * Discovery metadata is re-fetched automatically, tokens are not. The store
+     * is compressed and sharded, so a large cache must not drop the tokens.
      */
     const store = {
       'oauth-server': {
         serverId: 'oauth-server',
         serverUrl: 'https://mcp.example.com/mcp',
         tokens: { access_token: 'access-token-value', token_type: 'Bearer', refresh_token: 'refresh-token-value' },
-        discovery: { authorizationServerMetadata: { issuer: 'y'.repeat(MCP_OAUTH_COOKIE_LIMIT_BYTES - 800) } },
+        discovery: { authorizationServerMetadata: { issuer: 'y'.repeat(COOKIE_VALUE_LIMIT_BYTES - 800) } },
         updatedAt: new Date().toISOString(),
       },
     } as unknown as McpOAuthStore;
 
     const headers = await oauthStoreHeaders(store, { APP_ENCRYPTION_SECRET: SECRET });
-    const cookie = headers[0];
+    const live = headers.filter((cookie) => cookie.startsWith('mcp_oauth') && !cookie.includes('Max-Age=0'));
+    const cookie = live[0];
 
     expect(cookie).toContain('HttpOnly');
-    expect(store['oauth-server'].discovery).toBeUndefined();
 
     const request = new Request('https://bolt.example.test/api/mcp', {
-      headers: { Cookie: cookie.split(';')[0] },
+      headers: { Cookie: live.map((header) => header.split(';')[0]).join('; ') },
     });
     const restored = await readOAuthStore(request, { APP_ENCRYPTION_SECRET: SECRET });
 
@@ -279,7 +335,7 @@ describe('MCP OAuth client', () => {
     const cookies = await oauthStoreHeaders(store, {});
 
     expect(cookies[0]).toContain('mcp_oauth=');
-    expect(cookies[0]).toContain('Max-Age=0');
+    expect(cookies.every((cookie) => cookie.includes('Max-Age=0'))).toBe(true);
   });
 
   it('drops OAuth material when the server is removed or disconnected', async () => {
@@ -289,9 +345,11 @@ describe('MCP OAuth client', () => {
     const next = removeOAuthEntry(store, 'oauth-server');
 
     expect(next['oauth-server']).toBeUndefined();
-    expect(await oauthStoreHeaders(next, { APP_ENCRYPTION_SECRET: SECRET })).toEqual([
-      expect.stringContaining('Max-Age=0'),
-    ]);
+
+    const cleared = await oauthStoreHeaders(next, { APP_ENCRYPTION_SECRET: SECRET });
+
+    expect(cleared.length).toBeGreaterThanOrEqual(1);
+    expect(cleared.every((cookie) => cookie.includes('Max-Age=0'))).toBe(true);
   });
 });
 
