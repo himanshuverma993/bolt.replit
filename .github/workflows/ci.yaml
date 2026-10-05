@@ -26,8 +26,9 @@ jobs:
       - name: Run tests
         run: pnpm run test
 
-      # Wrangler 4 requires Node >= 22 while this repository pins Node 20 for the
-      # build/test steps, so the smoke test gets its own Node.
+      # Wrangler 4 and the Worker runtime (CompressionStream, workerd) need Node >= 22.
+      # Tests now use the same line as .nvmrc (22.16.0); keep an explicit Node 22
+      # step so the smoke test still works if the setup action is overridden.
       - name: Use Node.js 22 for the Workers runtime smoke test
         uses: actions/setup-node@v4
         with:
