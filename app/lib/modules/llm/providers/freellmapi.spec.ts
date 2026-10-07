@@ -57,6 +57,12 @@ describe('FreeLLMAPI provider', () => {
       expect(model.provider).toBe('FreeLLMAPI');
       expect(model.maxTokenAllowed).toBeGreaterThan(0);
     }
+
+    /*
+     * GLM 5.3 documents 128K max output upstream (z.ai), so bolt can safely
+     * request a large completion budget for long codegen turns.
+     */
+    expect(provider.staticModels.find((model) => model.name === 'glm-5.3:free')?.maxTokenAllowed).toBe(32768);
   });
 
   it('is a direct-connect provider that never demands an API key', () => {

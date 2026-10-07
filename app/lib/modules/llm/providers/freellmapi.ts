@@ -24,20 +24,23 @@ export const FREELLM_API_DEFAULT_BASE_URL = 'http://localhost:3001/v1';
  * action/tool pipeline.
  *
  * - `glm-5.3:free`        Zhipu GLM 5.3 via UnoRouter — 1M context, tools.
+ *                         Z.ai documents 128K max output (default max_tokens
+ *                         65536), so 32768 leaves headroom for long codegen.
  * - `moonshotai/Kimi-K3`  Moonshot Kimi K3 — 262K context, tools, one of
  *                         the strongest free agentic coding models.
  * - `glm-5.3-flash:free`  Fast GLM 5.3 variant via UnoRouter — 1M context.
  *
- * maxTokenAllowed is the completion-token budget passed to the model; the
- * values stay conservative because free tiers meter output tokens and bolt
- * transparently continues long generations via its continuation flow.
+ * maxTokenAllowed is the completion-token budget passed to the model. It
+ * stays under each upstream's documented output ceiling because free tiers
+ * meter output tokens; bolt transparently continues long generations via
+ * its continuation flow when a response ends on the length limit.
  */
 const FREELLM_STATIC_MODELS: ModelInfo[] = [
   {
     name: 'glm-5.3:free',
     label: 'GLM 5.3 (FreeLLMAPI · free)',
     provider: 'FreeLLMAPI',
-    maxTokenAllowed: 16384,
+    maxTokenAllowed: 32768,
   },
   {
     name: 'moonshotai/Kimi-K3',
