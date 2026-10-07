@@ -17,9 +17,19 @@ refreshGlobals.__vite_plugin_react_preamble_installed__ = true;
 
 const { APIKeyManager: apiKeyManager } = await import('./APIKeyManager');
 
-function provider(name: string, requiresApiKey: boolean): ProviderInfo {
-  return { name, staticModels: [], requiresApiKey };
+function provider(name: string, requiresApiKey: boolean, noApiKeyNote?: string): ProviderInfo {
+  return { name, staticModels: [], requiresApiKey, noApiKeyNote };
 }
+
+/**
+ * Kept in sync with `noApiKeyNote` on CloudflareProvider /
+ * FreeLLMAPIProvider — the panel must surface each provider's own
+ * explanation of why no key is needed.
+ */
+const CLOUDFLARE_NOTE = "no API key needed — runs on your Cloudflare account's Workers AI free tier.";
+const FREELLM_NOTE =
+  'no API key needed — free agentic coding models (GLM 5.3, Kimi K3) run through the FreeLLMAPI router. ' +
+  'If your router is not at the default URL, set its base URL under Settings → Providers.';
 
 function element(info: ProviderInfo, apiKey: string, setApiKey: (key: string) => void = () => undefined) {
   return React.createElement(apiKeyManager, { provider: info, apiKey, setApiKey });
@@ -29,12 +39,28 @@ afterEach(cleanup);
 
 describe('provider API key panel', () => {
   it('tells the user the Cloudflare provider needs no API key', () => {
-    render(element(provider('Cloudflare', false), ''));
+    render(element(provider('Cloudflare', false, CLOUDFLARE_NOTE), ''));
 
     const note = screen.getByText(/no API key needed/);
     expect(note.textContent).toContain('Cloudflare');
     expect(note.textContent).toContain('Workers AI');
     expect(screen.queryByTitle('Edit API Key')).toBeNull();
+  });
+
+  it('shows the FreeLLMAPI provider note instead of asking for a key', () => {
+    render(element(provider('FreeLLMAPI', false, FREELLM_NOTE), ''));
+
+    const note = screen.getByText(/no API key needed/);
+    expect(note.textContent).toContain('FreeLLMAPI');
+    expect(note.textContent).toContain('GLM 5.3');
+    expect(note.textContent).toContain('Kimi K3');
+    expect(screen.queryByTitle('Edit API Key')).toBeNull();
+  });
+
+  it('falls back to a generic note for keyless providers without one', () => {
+    render(element(provider('Keyless', false), ''));
+
+    expect(screen.getByText(/no API key needed/)).toBeTruthy();
   });
 
   it('shows a masked key for a keyed provider and saves an edit through setApiKey', () => {

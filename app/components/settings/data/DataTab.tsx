@@ -24,6 +24,7 @@ const API_KEY_PROVIDERS = [
   'Perplexity',
   'Cohere',
   'AzureOpenAI',
+  'FreeLLMAPI',
 ] as const;
 
 interface ApiKeys {

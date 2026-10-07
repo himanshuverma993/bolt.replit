@@ -13,6 +13,7 @@ export abstract class BaseProvider implements ProviderInfo {
   labelForGetApiKey?: string;
   icon?: string;
   requiresApiKey?: boolean;
+  noApiKeyNote?: string;
 
   getProviderBaseUrlAndKey(options: {
     apiKeys?: Record<string, string>;

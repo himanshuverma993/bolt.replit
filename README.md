@@ -204,6 +204,19 @@ For providers that support custom base URLs (such as Ollama or LM Studio), follo
 - Ollama
 - LM Studio
 - OpenAILike
+- FreeLLMAPI
+
+### FreeLLMAPI — free agentic coding models, no API key
+
+The **FreeLLMAPI** provider connects directly to the [FreeLLMAPI](https://freellmapi.co/) router with **no API key required**. It ships with the top free agentic coding models from the catalog:
+
+| Model | Router model id | Context | Notes |
+| --- | --- | --- | --- |
+| GLM 5.3 | `glm-5.3:free` | 1M tokens | Zhipu flagship, tool calling |
+| Kimi K3 | `moonshotai/Kimi-K3` | 262K tokens | Moonshot agentic coding model, tool calling |
+| GLM 5.3 Flash | `glm-5.3-flash:free` | 1M tokens | Fast GLM variant |
+
+The provider talks to the router's OpenAI-compatible endpoint, which defaults to `http://localhost:3001/v1`. If your router runs elsewhere, set its base URL in **Settings → Providers → FreeLLMAPI** (or via `FREELLM_API_BASE_URL` in `.env`). An optional unified key (`FREELLM_API_KEY`) is only needed if your router is configured to require one. Any additional chat models your router exposes are picked up automatically from its `/v1/models` endpoint.
 
 ## Setup Using Git (For Developers only)
 

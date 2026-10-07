@@ -566,6 +566,7 @@ export default class CloudflareProvider extends BaseProvider {
   labelForGetApiKey = 'No API key needed';
   icon = 'i-ph:cloud';
   requiresApiKey = false;
+  noApiKeyNote = "no API key needed — runs on your Cloudflare account's Workers AI free tier.";
 
   config = {};
 

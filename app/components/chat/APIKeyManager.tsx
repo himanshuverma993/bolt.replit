@@ -18,8 +18,8 @@ export const APIKeyManager: React.FC<APIKeyManagerProps> = ({ provider, apiKey, 
   if (provider.requiresApiKey === false) {
     return (
       <div className="mt-2 mb-4 text-xs text-bolt-elements-textSecondary">
-        <span className="text-bolt-elements-textPrimary">{provider.name}:</span> no API key needed — runs on your
-        Cloudflare account&apos;s Workers AI free tier.
+        <span className="text-bolt-elements-textPrimary">{provider.name}:</span>{' '}
+        {provider.noApiKeyNote || 'no API key needed.'}
       </div>
     );
   }
