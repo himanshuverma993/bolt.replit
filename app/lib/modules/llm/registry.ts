@@ -2,6 +2,7 @@ import AnthropicProvider from './providers/anthropic';
 import CohereProvider from './providers/cohere';
 import CloudflareProvider from './providers/cloudflare';
 import DeepseekProvider from './providers/deepseek';
+import FreeLLMAPIProvider from './providers/freellmapi';
 import GoogleProvider from './providers/google';
 import GroqProvider from './providers/groq';
 import HuggingFaceProvider from './providers/huggingface';
@@ -20,6 +21,7 @@ export {
   CohereProvider,
   CloudflareProvider,
   DeepseekProvider,
+  FreeLLMAPIProvider,
   GoogleProvider,
   GroqProvider,
   HuggingFaceProvider,

@@ -13,6 +13,9 @@ export type ProviderInfo = {
   labelForGetApiKey?: string;
   icon?: string;
   requiresApiKey?: boolean;
+
+  /** Explanation shown in the chat UI when requiresApiKey is false. */
+  noApiKeyNote?: string;
 };
 
 export interface IProviderSetting {
