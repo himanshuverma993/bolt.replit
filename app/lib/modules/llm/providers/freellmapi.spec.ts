@@ -59,10 +59,10 @@ describe('FreeLLMAPI provider', () => {
     }
 
     /*
-     * GLM 5.3 documents 128K max output upstream (z.ai), so bolt can safely
-     * request a large completion budget for long codegen turns.
+     * Hosted free lanes (UnoRouter :free) cap output at 8K tokens, so the
+     * budget stays at 8192; bolt's continuation flow covers longer turns.
      */
-    expect(provider.staticModels.find((model) => model.name === 'glm-5.3:free')?.maxTokenAllowed).toBe(32768);
+    expect(provider.staticModels.find((model) => model.name === 'glm-5.3:free')?.maxTokenAllowed).toBe(8192);
   });
 
   it('is a direct-connect provider that never demands an API key', () => {

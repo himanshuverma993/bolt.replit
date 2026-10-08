@@ -204,7 +204,7 @@ describe('FreeLLMAPI integration (mock router)', () => {
 
     const result = streamText({
       model,
-      maxTokens: 32768,
+      maxTokens: 8192,
       messages: [{ role: 'user', content: 'Edit my Cloudflare worker and deploy it.' }],
       tools: {
         mcp_cloudflare_workers_deploy: tool({
@@ -260,7 +260,7 @@ describe('FreeLLMAPI integration (mock router)', () => {
     // Direct-connect keyless auth: placeholder bearer, correct model id and budget.
     expect(first.headers.authorization).toBe('Bearer freellmapi-no-key');
     expect(first.body.model).toBe('glm-5.3:free');
-    expect(first.body.max_tokens).toBe(32768);
+    expect(first.body.max_tokens).toBe(8192);
     expect(first.body.stream).toBe(true);
     expect(first.body.tool_choice).toBe('auto');
     expect(Array.isArray(first.body.tools)).toBe(true);
