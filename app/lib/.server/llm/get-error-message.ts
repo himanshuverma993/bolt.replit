@@ -99,11 +99,53 @@ function unwrapRetryError(error: unknown): Record<string, unknown> | undefined {
 }
 
 /**
+ * The FreeLLMAPI provider is keyless and self-hosted: bolt talks straight to
+ * the router, which defaults to `localhost:3001`. When bolt itself is deployed
+ * (e.g. on Cloudflare Workers), that fetch hits the edge's loopback block and
+ * surfaces as a baffling "Forbidden (HTTP 403)". Detect this exact shape and
+ * answer with the actionable fix instead of the raw status. Only the fixed
+ * default address is matched — no user-supplied URL is ever echoed.
+ */
+const FREELLM_LOOPBACK_PATTERN = /(?:localhost|127\.0\.0\.1):3001/;
+
+function getFreeLlmLoopbackGuidance(record: Record<string, unknown> | undefined): string | undefined {
+  const url = typeof record?.url === 'string' ? record.url : '';
+
+  if (!FREELLM_LOOPBACK_PATTERN.test(url)) {
+    return undefined;
+  }
+
+  const statusCode = typeof record?.statusCode === 'number' ? record.statusCode : undefined;
+
+  /*
+   * 403 = edge loopback block; undefined = fetch could not connect at all
+   * (router not running). Any other status is a real router answer.
+   */
+  if (statusCode !== undefined && statusCode !== 403) {
+    return undefined;
+  }
+
+  return (
+    'FreeLLMAPI router is not reachable at localhost:3001 (this deployment cannot connect to your machine — ' +
+    'hosted builds such as Cloudflare Workers get HTTP 403 for loopback). Run the FreeLLMAPI router and point ' +
+    'bolt at its public URL: Settings → Providers → FreeLLMAPI, or FREELLM_API_BASE_URL.'
+  );
+}
+
+/**
  * Converts provider/AI SDK errors to a bounded message safe to send to the browser.
  * Request bodies, URLs, headers, API keys, and user content are never included.
  */
 export function getErrorMessage(error: unknown): string {
   const record = unwrapRetryError(error);
+  const guidance = getFreeLlmLoopbackGuidance(record);
+
+  if (guidance) {
+    console.error('[llm] streaming error:', guidance);
+
+    return guidance;
+  }
+
   const statusCode = typeof record?.statusCode === 'number' ? ` (HTTP ${record.statusCode})` : '';
   const message =
     typeof record?.message === 'string'

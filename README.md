@@ -218,6 +218,18 @@ The **FreeLLMAPI** provider connects directly to the [FreeLLMAPI](https://freell
 
 The provider talks to the router's OpenAI-compatible endpoint, which defaults to `http://localhost:3001/v1`. If your router runs elsewhere, set its base URL in **Settings → Providers → FreeLLMAPI** (or via `FREELLM_API_BASE_URL` in `.env`). An optional unified key (`FREELLM_API_KEY`) is only needed if your router is configured to require one. Any additional chat models your router exposes are picked up automatically from its `/v1/models` endpoint.
 
+#### If bolt is hosted (Cloudflare Workers)
+
+A hosted bolt cannot reach `localhost` on your machine — Cloudflare Workers block loopback fetches with **HTTP 403**, which surfaces as `Forbidden (HTTP 403)` in the chat. Expose your router with a public URL instead (free, no API key):
+
+1. Run the router on your machine: `curl -fsSL https://freellmapi.co/install.sh | bash`
+
+2. Give it a public address, e.g. `cloudflared tunnel --url http://localhost:3001` (prints an `https://…trycloudflare.com` URL)
+
+3. Paste that URL into **Settings → Providers → FreeLLMAPI** (append `/v1`), or set `FREELLM_API_BASE_URL`.
+
+When bolt runs locally (`pnpm dev` / docker), the default `localhost:3001` works as-is.
+
 ## Setup Using Git (For Developers only)
 
 This method is recommended for developers who want to:

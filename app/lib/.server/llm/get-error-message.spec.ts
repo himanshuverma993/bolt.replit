@@ -36,4 +36,40 @@ describe('getErrorMessage', () => {
     expect(message).toContain('model_not_found');
     expect(message).not.toContain('responseBody');
   });
+
+  it('answers the FreeLLMAPI loopback 403 with actionable router guidance', () => {
+    const message = getErrorMessage({
+      message: 'Forbidden',
+      statusCode: 403,
+      url: 'http://localhost:3001/v1/chat/completions',
+    });
+
+    expect(message).toContain('FreeLLMAPI router is not reachable');
+    expect(message).toContain('Settings → Providers → FreeLLMAPI');
+    expect(message).toContain('FREELLM_API_BASE_URL');
+  });
+
+  it('covers the 127.0.0.1 form and connection failures, but leaves real router statuses alone', () => {
+    const loopbackIp = getErrorMessage({
+      message: 'Forbidden',
+      statusCode: 403,
+      url: 'http://127.0.0.1:3001/v1/chat/completions',
+    });
+
+    expect(loopbackIp).toContain('FreeLLMAPI router is not reachable');
+
+    const noRouter = getErrorMessage({ message: 'fetch failed', url: 'http://localhost:3001/v1/chat/completions' });
+
+    expect(noRouter).toContain('FreeLLMAPI router is not reachable');
+
+    const realRouterError = getErrorMessage({
+      message: 'Too Many Requests',
+      statusCode: 429,
+      url: 'http://localhost:3001/v1/chat/completions',
+    });
+
+    expect(realRouterError).toContain('Too Many Requests');
+    expect(realRouterError).toContain('(HTTP 429)');
+    expect(realRouterError).not.toContain('FreeLLMAPI router is not reachable');
+  });
 });

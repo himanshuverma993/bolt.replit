@@ -71,8 +71,9 @@ export default class FreeLLMAPIProvider extends BaseProvider {
   icon = 'i-ph:info';
   requiresApiKey = false;
   noApiKeyNote =
-    'no API key needed — free agentic coding models (GLM 5.3, Kimi K3) run through the FreeLLMAPI router. ' +
-    'If your router is not at the default URL, set its base URL under Settings → Providers.';
+    'no API key needed — free agentic coding models (GLM 5.3, Kimi K3) run through your FreeLLMAPI router. ' +
+    'Local bolt builds reach it at the default localhost:3001; hosted builds (e.g. Cloudflare Workers) need the ' +
+    "router's public URL under Settings → Providers.";
 
   config = {
     baseUrlKey: 'FREELLM_API_BASE_URL',
