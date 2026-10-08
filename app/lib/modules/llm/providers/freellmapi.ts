@@ -25,28 +25,34 @@ export const FREELLM_API_DEFAULT_BASE_URL = 'http://localhost:3001/v1';
  *
  * - `glm-5.3:free`        Zhipu GLM 5.3 via UnoRouter — 1M context, tools.
  *                         Z.ai documents 128K max output (default max_tokens
- *                         65536), so 32768 leaves headroom for long codegen.
+ *                         65536), so the 8K budget below sits far inside it.
  * - `moonshotai/Kimi-K3`  Moonshot Kimi K3 — 262K context, tools, one of
  *                         the strongest free agentic coding models.
  * - `glm-5.3-flash:free`  Fast GLM 5.3 variant via UnoRouter — 1M context.
  *
- * maxTokenAllowed is the completion-token budget passed to the model. It
- * stays under each upstream's documented output ceiling because free tiers
- * meter output tokens; bolt transparently continues long generations via
- * its continuation flow when a response ends on the length limit.
+ * The router can run self-hosted (default localhost:3001), or bolt can be
+ * pointed straight at a hosted free gateway with the same model ids —
+ * UnoRouter (https://api.unorouter.com/v1, free :free lane, GitHub/Discord
+ * sign-up) or the HuggingFace Router (https://router.huggingface.co/v1,
+ * free HF token) — via Settings → Providers + the optional key field.
+ *
+ * maxTokenAllowed is the completion-token budget passed to the model. It is
+ * capped at 8K because hosted free lanes (UnoRouter :free) limit output to
+ * 8K tokens; bolt transparently continues long generations via its
+ * continuation flow when a response ends on the length limit.
  */
 const FREELLM_STATIC_MODELS: ModelInfo[] = [
   {
     name: 'glm-5.3:free',
     label: 'GLM 5.3 (FreeLLMAPI · free)',
     provider: 'FreeLLMAPI',
-    maxTokenAllowed: 32768,
+    maxTokenAllowed: 8192,
   },
   {
     name: 'moonshotai/Kimi-K3',
     label: 'Kimi K3 (FreeLLMAPI · free)',
     provider: 'FreeLLMAPI',
-    maxTokenAllowed: 16384,
+    maxTokenAllowed: 8192,
   },
   {
     name: 'glm-5.3-flash:free',

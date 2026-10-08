@@ -216,7 +216,18 @@ The **FreeLLMAPI** provider connects directly to the [FreeLLMAPI](https://freell
 | Kimi K3 | `moonshotai/Kimi-K3` | 262K tokens | Moonshot agentic coding model, tool calling |
 | GLM 5.3 Flash | `glm-5.3-flash:free` | 1M tokens | Fast GLM variant |
 
-The provider talks to the router's OpenAI-compatible endpoint, which defaults to `http://localhost:3001/v1`. If your router runs elsewhere, set its base URL in **Settings → Providers → FreeLLMAPI** (or via `FREELLM_API_BASE_URL` in `.env`). An optional unified key (`FREELLM_API_KEY`) is only needed if your router is configured to require one. Any additional chat models your router exposes are picked up automatically from its `/v1/models` endpoint.
+The provider talks to the router's OpenAI-compatible endpoint, which defaults to `http://localhost:3001/v1`. If your router runs elsewhere, set its base URL in **Settings → Providers → FreeLLMAPI** (or via `FREELLM_API_BASE_URL` in `.env`). An optional unified key (`FREELLM_API_KEY`, or the **Optional key** field in the chat panel) is only needed if your endpoint requires one. Any additional chat models your router exposes are picked up automatically from its `/v1/models` endpoint.
+
+The same model ids also work **without the router**, straight against hosted free gateways — set the gateway as the base URL and paste its free key into the Optional key field:
+
+| Gateway | Base URL | Free key |
+| --- | --- | --- |
+| UnoRouter (GLM 5.3 `:free` lane) | `https://api.unorouter.com/v1` | free, GitHub/Discord sign-up, no card |
+| HuggingFace Router (Kimi K3 etc.) | `https://router.huggingface.co/v1` | free HuggingFace token |
+
+#### No laptop? Phone-only setup
+
+Everything above can be done from a phone: create the free UnoRouter/HuggingFace account in the browser, then in bolt set the base URL + optional key under **Settings → Providers → FreeLLMAPI**. For the full self-hosted router on Android, run it in **Termux** (`pkg install nodejs` then the install script) and expose it with `cloudflared tunnel --url http://localhost:3001` (also installable in Termux), then paste the tunnel URL as the base URL.
 
 #### If bolt is hosted (Cloudflare Workers)
 

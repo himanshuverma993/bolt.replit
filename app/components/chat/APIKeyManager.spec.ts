@@ -28,8 +28,9 @@ function provider(name: string, requiresApiKey: boolean, noApiKeyNote?: string):
  */
 const CLOUDFLARE_NOTE = "no API key needed — runs on your Cloudflare account's Workers AI free tier.";
 const FREELLM_NOTE =
-  'no API key needed — free agentic coding models (GLM 5.3, Kimi K3) run through the FreeLLMAPI router. ' +
-  'If your router is not at the default URL, set its base URL under Settings → Providers.';
+  'no API key needed — free agentic coding models (GLM 5.3, Kimi K3) run through your FreeLLMAPI router. ' +
+  'Local bolt builds reach it at the default localhost:3001; hosted builds (e.g. Cloudflare Workers) need the ' +
+  "router's public URL under Settings → Providers.";
 
 function element(info: ProviderInfo, apiKey: string, setApiKey: (key: string) => void = () => undefined) {
   return React.createElement(apiKeyManager, { provider: info, apiKey, setApiKey });
@@ -44,7 +45,8 @@ describe('provider API key panel', () => {
     const note = screen.getByText(/no API key needed/);
     expect(note.textContent).toContain('Cloudflare');
     expect(note.textContent).toContain('Workers AI');
-    expect(screen.queryByTitle('Edit API Key')).toBeNull();
+    expect(screen.getByText(/Optional key:/)).toBeTruthy();
+    expect(screen.getByText('not set (works without a key)')).toBeTruthy();
   });
 
   it('shows the FreeLLMAPI provider note instead of asking for a key', () => {
@@ -54,7 +56,20 @@ describe('provider API key panel', () => {
     expect(note.textContent).toContain('FreeLLMAPI');
     expect(note.textContent).toContain('GLM 5.3');
     expect(note.textContent).toContain('Kimi K3');
-    expect(screen.queryByTitle('Edit API Key')).toBeNull();
+  });
+
+  it('lets a keyless provider store an optional key (UnoRouter / HuggingFace token)', () => {
+    const setApiKey = vi.fn();
+
+    render(element(provider('FreeLLMAPI', false, FREELLM_NOTE), '', setApiKey));
+
+    fireEvent.click(screen.getByTitle('Edit API Key'));
+
+    const input = screen.getByPlaceholderText(/Optional key/) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'unr-free-key' } });
+    fireEvent.click(screen.getByTitle('Save API Key'));
+
+    expect(setApiKey).toHaveBeenCalledWith('unr-free-key');
   });
 
   it('falls back to a generic note for keyless providers without one', () => {
